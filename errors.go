@@ -12,6 +12,7 @@ type ErrorKind string
 const (
 	ErrorUnknown        ErrorKind = "unknown"
 	ErrorAuthentication ErrorKind = "authentication"
+	ErrorTokenExpired   ErrorKind = "token_expired"
 	ErrorPermission     ErrorKind = "permission"
 	ErrorInvalidRequest ErrorKind = "invalid_request"
 	ErrorNotFound       ErrorKind = "not_found"

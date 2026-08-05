@@ -95,6 +95,7 @@ var explicit = []Provider{
 	p("azure", BackendAzure, Language),
 	p("bedrock", BackendBedrock, Language, Embedding, Reranking, Image),
 	p("cohere", BackendCohere, Language, Embedding, Reranking),
+	p("codex", BackendResponses, Language),
 	p("google", BackendGoogle, Language, Embedding, Image, Video, Files),
 	p("mistral", BackendMistral, Language, Embedding),
 	p("openai", BackendOpenAI, Language, Embedding, Speech, Transcription, Image, Files),

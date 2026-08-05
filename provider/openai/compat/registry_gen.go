@@ -108,6 +108,7 @@ var profiles = map[string]Profile{
 	"inception":                           {ID: "inception", DisplayName: "Inception Labs", BaseURL: "https://api.inceptionlabs.ai/v1", EnvKey: "INCEPTION_API_KEY", Behavior: BehaviorFull},
 	"inceptron":                           {ID: "inceptron", DisplayName: "Inceptron", BaseURL: "https://api.inceptron.io/v1", EnvKey: "INCEPTRON_API_KEY", Behavior: BehaviorFull},
 	"inference_net":                       {ID: "inference_net", DisplayName: "Inference.net", BaseURL: "https://api.inference.net/v1", EnvKey: "INFERENCE_NET_API_KEY", Behavior: BehaviorFull},
+	"inferencehub":                        {ID: "inferencehub", DisplayName: "InferenceHub", BaseURL: "https://app.inferencehub.tech/v1", EnvKey: "INFERENCEHUB_API_KEY", Behavior: BehaviorFull},
 	"inferx":                              {ID: "inferx", DisplayName: "InferX", BaseURL: "https://model.inferx.net/v1", EnvKey: "INFERX_API_KEY", Behavior: BehaviorFull},
 	"infinity":                            {ID: "infinity", DisplayName: "Infinity AI", BaseURL: "https://infinity.ai/api/v1", EnvKey: "INFINITY_API_KEY", Behavior: BehaviorFull},
 	"io_net":                              {ID: "io_net", DisplayName: "IO.NET", BaseURL: "https://api.intelligence.io.solutions/api/v1", EnvKey: "IOINTELLIGENCE_API_KEY", Behavior: BehaviorFull},

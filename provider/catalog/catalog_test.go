@@ -17,14 +17,14 @@ func TestProviderMatrix(t *testing.T) {
 		}
 		seen[provider.ID] = true
 	}
-	for _, id := range []string{"openai", "anthropic", "google", "bedrock", "tavily", "groq", "deepseek"} {
+	for _, id := range []string{"openai", "anthropic", "google", "bedrock", "codex", "inferencehub", "tavily", "groq", "deepseek"} {
 		if _, ok := Lookup(id); !ok {
 			t.Fatalf("missing provider %s", id)
 		}
 	}
 	for id, want := range map[string]Backend{
-		"groq": BackendResponses, "openrouter": BackendResponses, "vercel": BackendResponses,
-		"minimax": BackendAnthropic, "tencent_token_plan": BackendAnthropic, "togetherai": BackendOpenAICompat,
+		"codex": BackendResponses, "groq": BackendResponses, "openrouter": BackendResponses, "vercel": BackendResponses,
+		"inferencehub": BackendOpenAICompat, "minimax": BackendAnthropic, "tencent_token_plan": BackendAnthropic, "togetherai": BackendOpenAICompat,
 	} {
 		provider, ok := Lookup(id)
 		if !ok || provider.Backend != want {

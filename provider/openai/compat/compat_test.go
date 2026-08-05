@@ -24,6 +24,9 @@ func TestRegistryAndProfiles(t *testing.T) {
 	if minimax, ok := Lookup("minimax"); !ok || minimax.Protocol != ProtocolAnthropic {
 		t.Fatalf("minimax = %#v/%v", minimax, ok)
 	}
+	if inferenceHub, ok := Lookup("inferencehub"); !ok || inferenceHub.BaseURL != "https://app.inferencehub.tech/v1" || inferenceHub.EnvKey != "INFERENCEHUB_API_KEY" {
+		t.Fatalf("inferencehub = %#v/%v", inferenceHub, ok)
+	}
 	for _, profile := range All() {
 		if profile.BaseURL == "" {
 			continue
