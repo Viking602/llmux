@@ -54,6 +54,10 @@ CGO_ENABLED=0 go test ./...
 go test -run '^$' -bench . -benchmem ./benchmarks
 ```
 
+### Acknowledgements
+
+Thanks to the [AIMux](https://github.com/arcships/aimux) project for its provider research and protocol references.
+
 ---
 
 ## 简体中文
@@ -107,3 +111,7 @@ ChatGPT 订阅端点属于未公开、尽力而为的接入方式。调用方负
 CGO_ENABLED=0 go test ./...
 go test -run '^$' -bench . -benchmem ./benchmarks
 ```
+
+### 致谢
+
+感谢 [AIMux](https://github.com/arcships/aimux) 项目提供的供应商研究和协议实现参考。
