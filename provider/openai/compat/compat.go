@@ -47,6 +47,10 @@ type Config struct {
 	Client           *http.Client
 	Retry            llmux.RetryPolicy
 	AllowEmptyAPIKey bool
+	// DefaultMaxOutputTokens is forwarded to Anthropic-protocol providers as
+	// their provider-level max_tokens default when a request omits
+	// CallOptions.MaxOutputTokens. Zero keeps the Anthropic package default.
+	DefaultMaxOutputTokens int
 }
 
 func Lookup(id string) (Profile, bool) {
@@ -100,6 +104,7 @@ func New(id string, config Config) (llmux.Provider, error) {
 			APIKey: apiKey, BaseURL: baseURL, Headers: config.Headers, Client: config.Client, Retry: config.Retry,
 			ProviderName: profile.ID, AllowEmptyAPIKey: allowEmptyAPIKey,
 			APIKeyHeader: profile.APIKeyHeader, APIKeyPrefix: profile.APIKeyPrefix,
+			DefaultMaxOutputTokens: config.DefaultMaxOutputTokens,
 		})
 	}
 	behavior := openai.FullProfile()

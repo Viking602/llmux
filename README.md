@@ -24,10 +24,14 @@ model, err := provider.LanguageModel("gpt-5.6")
 if err != nil {
     log.Fatal(err)
 }
+maxOutput := 8192
 result, err := model.Generate(ctx, llmux.Request{
     Messages: []llmux.Message{llmux.TextMessage(llmux.RoleUser, "hello")},
+    Options:  llmux.CallOptions{MaxOutputTokens: &maxOutput},
 })
 ```
+
+Anthropic Messages (including Anthropic-compatible vendors such as DeepSeek) requires `max_tokens`. Set `CallOptions.MaxOutputTokens` on each request, or set `anthropic.Config.DefaultMaxOutputTokens` / `compat.Config.DefaultMaxOutputTokens` for a provider-level default. When neither is set, the library uses `4096`.
 
 ### Codex and InferenceHub
 
@@ -82,10 +86,14 @@ model, err := provider.LanguageModel("gpt-5.6")
 if err != nil {
     log.Fatal(err)
 }
+maxOutput := 8192
 result, err := model.Generate(ctx, llmux.Request{
     Messages: []llmux.Message{llmux.TextMessage(llmux.RoleUser, "hello")},
+    Options:  llmux.CallOptions{MaxOutputTokens: &maxOutput},
 })
 ```
+
+Anthropic Messages（含 DeepSeek 等 Anthropic 兼容供应商）必须提供 `max_tokens`。请在请求上设置 `CallOptions.MaxOutputTokens`，或在 `anthropic.Config.DefaultMaxOutputTokens` / `compat.Config.DefaultMaxOutputTokens` 配置提供商级默认值。两者都未设置时，库使用 `4096`。
 
 ### Codex 与 InferenceHub
 

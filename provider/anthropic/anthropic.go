@@ -20,6 +20,11 @@ import (
 const (
 	defaultBaseURL = "https://api.anthropic.com"
 	defaultVersion = "2023-06-01"
+	// DefaultMaxOutputTokens is used for Anthropic Messages max_tokens when the
+	// request does not set CallOptions.MaxOutputTokens and Config also leaves
+	// DefaultMaxOutputTokens unset. Anthropic requires max_tokens; hosts that
+	// know a higher model limit should set one of those two fields.
+	DefaultMaxOutputTokens = 4096
 )
 
 type Config struct {
@@ -34,6 +39,10 @@ type Config struct {
 	AllowEmptyAPIKey bool
 	APIKeyHeader     string
 	APIKeyPrefix     string
+	// DefaultMaxOutputTokens is the provider-level max_tokens used when a
+	// request omits CallOptions.MaxOutputTokens. Zero keeps
+	// DefaultMaxOutputTokens (4096). Request-level MaxOutputTokens always wins.
+	DefaultMaxOutputTokens int
 }
 
 type Provider struct{ config Config }
@@ -82,6 +91,13 @@ func (provider *Provider) LanguageModel(modelID string) (llmux.LanguageModel, er
 }
 
 func (model *model) ModelID() string { return model.id }
+
+func (provider *Provider) defaultMaxOutputTokens() int {
+	if provider.config.DefaultMaxOutputTokens > 0 {
+		return provider.config.DefaultMaxOutputTokens
+	}
+	return DefaultMaxOutputTokens
+}
 
 func (model *model) Generate(ctx context.Context, request llmux.Request) (llmux.Result, error) {
 	body, err := model.build(request, false)
@@ -194,7 +210,7 @@ func (model *model) build(request llmux.Request, streaming bool) ([]byte, error)
 		}
 		messages = append(messages, wire)
 	}
-	maxTokens := 4096
+	maxTokens := model.provider.defaultMaxOutputTokens()
 	if request.Options.MaxOutputTokens != nil {
 		maxTokens = *request.Options.MaxOutputTokens
 	}

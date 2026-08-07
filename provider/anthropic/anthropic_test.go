@@ -72,3 +72,58 @@ func TestCustomAuthHeader(t *testing.T) {
 		t.Fatalf("headers = %#v", headers)
 	}
 }
+
+func TestMaxTokensDefaultsAndOverrides(t *testing.T) {
+	var got []int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		maxTokens, _ := body["max_tokens"].(float64)
+		got = append(got, int(maxTokens))
+		_, _ = fmt.Fprint(response, `{"id":"msg-1","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	// Package default when neither Config nor request sets a limit.
+	provider, err := New(Config{APIKey: "test-key", BaseURL: server.URL, Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, _ := provider.LanguageModel("claude-test")
+	if _, err = model.Generate(context.Background(), llmux.Request{
+		Messages: []llmux.Message{llmux.TextMessage(llmux.RoleUser, "hi")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Provider-level default for catalog max-output (e.g. DeepSeek 384000).
+	provider, err = New(Config{
+		APIKey: "test-key", BaseURL: server.URL, Client: server.Client(),
+		DefaultMaxOutputTokens: 384000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, _ = provider.LanguageModel("claude-test")
+	if _, err = model.Generate(context.Background(), llmux.Request{
+		Messages: []llmux.Message{llmux.TextMessage(llmux.RoleUser, "hi")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Per-request MaxOutputTokens always wins over the provider default.
+	maxOutput := 2048
+	if _, err = model.Generate(context.Background(), llmux.Request{
+		Messages: []llmux.Message{llmux.TextMessage(llmux.RoleUser, "hi")},
+		Options:  llmux.CallOptions{MaxOutputTokens: &maxOutput},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 3 || got[0] != DefaultMaxOutputTokens || got[1] != 384000 || got[2] != 2048 {
+		t.Fatalf("max_tokens sequence = %v, want [%d 384000 2048]", got, DefaultMaxOutputTokens)
+	}
+}
