@@ -48,12 +48,18 @@ type Provider struct {
 }
 
 func Lookup(id string) (Provider, bool) {
-	id = strings.ToLower(strings.TrimSpace(id))
+	id = normalizeProviderID(id)
 	if profile, ok := opencompat.Lookup(id); ok {
 		return providerFromProfile(profile), true
 	}
 	provider, ok := explicitByID[id]
 	return provider, ok
+}
+
+// normalizeProviderID lowercases ids and maps underscores to hyphens so
+// catalog lookups align with models.dev-style provider ids.
+func normalizeProviderID(id string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(id)), "_", "-")
 }
 
 func All() []Provider {
@@ -91,7 +97,7 @@ func providerFromProfile(profile opencompat.Profile) Provider {
 
 var explicit = []Provider{
 	p("anthropic", BackendAnthropic, Language),
-	p("anthropic_aws", BackendBedrock, Language),
+	p("anthropic-aws", BackendBedrock, Language),
 	p("azure", BackendAzure, Language),
 	p("bedrock", BackendBedrock, Language, Embedding, Reranking, Image),
 	p("cohere", BackendCohere, Language, Embedding, Reranking),
@@ -117,17 +123,17 @@ var explicit = []Provider{
 	p("fal", BackendNativeHTTP, Transcription, Image, Video),
 	p("gladia", BackendNativeHTTP, Transcription),
 	p("revai", BackendNativeHTTP, Transcription),
-	p("black_forest_labs", BackendNativeHTTP, Image),
+	p("black-forest-labs", BackendNativeHTTP, Image),
 	p("luma", BackendNativeHTTP, Image),
 	p("prodia", BackendNativeHTTP, Image, Video),
 	p("replicate", BackendNativeHTTP, Image, Video),
 	p("klingai", BackendNativeHTTP, Video),
-	p("open_responses", BackendResponses, Language),
+	p("open-responses", BackendResponses, Language),
 	p("cybertron", BackendOpenAICompat, Language),
-	p("docker_model_runner", BackendOpenAICompat, Language),
+	p("docker-model-runner", BackendOpenAICompat, Language),
 	p("gaudi", BackendOpenAICompat, Language),
 	p("jlama", BackendOpenAICompat, Language),
-	p("litellm_proxy", BackendOpenAICompat, Language),
+	p("litellm-proxy", BackendOpenAICompat, Language),
 	p("llamacpp", BackendOpenAICompat, Language),
 	p("local", BackendOpenAICompat, Language),
 	p("localai", BackendOpenAICompat, Language),
@@ -139,33 +145,33 @@ var explicit = []Provider{
 	p("sglang", BackendOpenAICompat, Language),
 	p("vllm", BackendOpenAICompat, Language),
 	p("xinference", BackendOpenAICompat, Language),
-	p("jina_ai", BackendNativeHTTP, Reranking),
-	p("aws_polly", BackendNativeHTTP, Speech),
+	p("jina-ai", BackendNativeHTTP, Reranking),
+	p("aws-polly", BackendNativeHTTP, Speech),
 	p("recraft", BackendNativeHTTP, Image),
 	p("stability", BackendNativeHTTP, Image),
 	p("runwayml", BackendNativeHTTP, Video),
-	p("bedrock_mantle", BackendOpenAICompat, Language),
-	p("vertex_ai_ai21_models", BackendOpenAICompat, Language),
-	p("vertex_ai_anthropic_models", BackendOpenAICompat, Language),
-	p("vertex_ai_deepseek_models", BackendOpenAICompat, Language),
-	p("vertex_ai_llama_models", BackendOpenAICompat, Language),
-	p("vertex_ai_minimax_models", BackendOpenAICompat, Language),
-	p("vertex_ai_mistral_models", BackendOpenAICompat, Language),
-	p("vertex_ai_moonshot_models", BackendOpenAICompat, Language),
-	p("vertex_ai_openai_models", BackendOpenAICompat, Language),
-	p("vertex_ai_qwen_models", BackendOpenAICompat, Language),
-	p("vertex_ai_zai_models", BackendOpenAICompat, Language),
+	p("bedrock-mantle", BackendOpenAICompat, Language),
+	p("vertex-ai-ai21-models", BackendOpenAICompat, Language),
+	p("vertex-ai-anthropic-models", BackendOpenAICompat, Language),
+	p("vertex-ai-deepseek-models", BackendOpenAICompat, Language),
+	p("vertex-ai-llama-models", BackendOpenAICompat, Language),
+	p("vertex-ai-minimax-models", BackendOpenAICompat, Language),
+	p("vertex-ai-mistral-models", BackendOpenAICompat, Language),
+	p("vertex-ai-moonshot-models", BackendOpenAICompat, Language),
+	p("vertex-ai-openai-models", BackendOpenAICompat, Language),
+	p("vertex-ai-qwen-models", BackendOpenAICompat, Language),
+	p("vertex-ai-zai-models", BackendOpenAICompat, Language),
 	p("dataforseo", BackendNativeHTTP, Search),
-	p("exa_ai", BackendNativeHTTP, Search),
+	p("exa-ai", BackendNativeHTTP, Search),
 	p("firecrawl", BackendNativeHTTP, Search),
-	p("google_pse", BackendNativeHTTP, Search),
+	p("google-pse", BackendNativeHTTP, Search),
 	p("linkup", BackendNativeHTTP, Search),
-	p("parallel_ai", BackendNativeHTTP, Search),
+	p("parallel-ai", BackendNativeHTTP, Search),
 	p("searxng", BackendNativeHTTP, Search),
 	p("serper", BackendNativeHTTP, Search),
 	p("tavily", BackendNativeHTTP, Search),
 	p("tinyfish", BackendNativeHTTP, Search),
-	p("you_com", BackendNativeHTTP, Search),
+	p("you-com", BackendNativeHTTP, Search),
 }
 
 var explicitByID = func() map[string]Provider {

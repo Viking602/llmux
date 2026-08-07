@@ -24,11 +24,17 @@ func TestProviderMatrix(t *testing.T) {
 	}
 	for id, want := range map[string]Backend{
 		"codex": BackendResponses, "groq": BackendResponses, "openrouter": BackendResponses, "vercel": BackendResponses,
-		"inferencehub": BackendOpenAICompat, "minimax": BackendAnthropic, "tencent_token_plan": BackendAnthropic, "togetherai": BackendOpenAICompat,
+		"inferencehub": BackendOpenAICompat, "minimax": BackendAnthropic, "tencent-token-plan": BackendAnthropic,
+		"deepseek": BackendAnthropic, "kimi": BackendAnthropic, "mimo": BackendAnthropic, "zai": BackendAnthropic,
+		"togetherai": BackendOpenAICompat, "alibaba-coding-plan": BackendAnthropic,
+		"black-forest-labs": BackendNativeHTTP, "vertex-ai-anthropic-models": BackendOpenAICompat,
 	} {
 		provider, ok := Lookup(id)
 		if !ok || provider.Backend != want {
 			t.Fatalf("%s backend = %q/%v, want %q", id, provider.Backend, ok, want)
 		}
+	}
+	if provider, ok := Lookup("tencent_token_plan"); !ok || provider.ID != "tencent-token-plan" {
+		t.Fatalf("underscore alias = %#v/%v", provider, ok)
 	}
 }

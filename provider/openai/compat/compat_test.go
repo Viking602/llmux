@@ -18,11 +18,30 @@ func TestRegistryAndProfiles(t *testing.T) {
 		t.Fatalf("groq = %#v/%v", groq, ok)
 	}
 	deepSeek, ok := Lookup("deepseek")
-	if !ok || deepSeek.Behavior != BehaviorDeepSeek {
+	if !ok || deepSeek.Behavior != BehaviorDeepSeek || deepSeek.Protocol != ProtocolAnthropic || deepSeek.BaseURL != "https://api.deepseek.com/anthropic" {
 		t.Fatalf("deepseek = %#v/%v", deepSeek, ok)
 	}
 	if minimax, ok := Lookup("minimax"); !ok || minimax.Protocol != ProtocolAnthropic {
 		t.Fatalf("minimax = %#v/%v", minimax, ok)
+	}
+	for id, baseURL := range map[string]string{
+		"kimi":            "https://api.moonshot.ai/anthropic",
+		"kimi-for-coding": "https://api.kimi.com/coding",
+		"moonshotai":      "https://api.moonshot.cn/anthropic",
+		"mimo":            "https://api.xiaomimimo.com/anthropic",
+		"longcat":         "https://api.longcat.chat/anthropic",
+		"zai":             "https://api.z.ai/api/anthropic",
+		"zhipu-v4":        "https://open.bigmodel.cn/api/anthropic",
+		"siliconflow":     "https://api.siliconflow.cn",
+	} {
+		profile, ok := Lookup(id)
+		if !ok || profile.Protocol != ProtocolAnthropic || profile.BaseURL != baseURL {
+			t.Fatalf("%s = %#v/%v, want anthropic %s", id, profile, ok, baseURL)
+		}
+	}
+	// Underscore aliases keep working for older callers.
+	if profile, ok := Lookup("alibaba_coding_plan"); !ok || profile.ID != "alibaba-coding-plan" {
+		t.Fatalf("underscore alias = %#v/%v", profile, ok)
 	}
 	if inferenceHub, ok := Lookup("inferencehub"); !ok || inferenceHub.BaseURL != "https://app.inferencehub.tech/v1" || inferenceHub.EnvKey != "INFERENCEHUB_API_KEY" {
 		t.Fatalf("inferencehub = %#v/%v", inferenceHub, ok)
@@ -77,7 +96,7 @@ func TestAnthropicProfileUsesProviderAuth(t *testing.T) {
 		_, _ = response.Write([]byte(`{"id":"msg-1","model":"glm-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
 	}))
 	defer server.Close()
-	provider, err := New("zai_coding_plan", Config{APIKey: "test", BaseURL: server.URL, Client: server.Client()})
+	provider, err := New("zai-coding-plan", Config{APIKey: "test", BaseURL: server.URL, Client: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}

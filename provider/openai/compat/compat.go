@@ -50,8 +50,16 @@ type Config struct {
 }
 
 func Lookup(id string) (Profile, bool) {
-	profile, ok := profiles[strings.ToLower(strings.TrimSpace(id))]
+	id = normalizeProviderID(id)
+	profile, ok := profiles[id]
 	return profile, ok
+}
+
+// normalizeProviderID lowercases ids and maps underscores to hyphens so
+// callers matching models.dev-style provider ids stay compatible with older
+// underscore spellings.
+func normalizeProviderID(id string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(id)), "_", "-")
 }
 
 func All() []Profile {
