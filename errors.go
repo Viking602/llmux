@@ -21,6 +21,7 @@ const (
 	ErrorServer         ErrorKind = "server"
 	ErrorStream         ErrorKind = "stream"
 	ErrorCancelled      ErrorKind = "cancelled"
+	ErrorUnsupported    ErrorKind = "unsupported"
 )
 
 type ProviderError struct {

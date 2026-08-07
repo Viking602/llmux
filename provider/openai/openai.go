@@ -58,6 +58,9 @@ type Config struct {
 	APIKeyHeader     string
 	APIKeyPrefix     string
 	Endpoint         string
+	// ListModelsURL overrides the default BaseURL+"/models" discovery path
+	// (for example Azure data-plane /openai/models?api-version=...).
+	ListModelsURL string
 }
 
 type Provider struct {

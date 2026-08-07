@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-func signV4(requestURL *url.URL, body []byte, headers http.Header, credentials Credentials, region string, now time.Time) {
+func signV4(method string, requestURL *url.URL, body []byte, headers http.Header, credentials Credentials, region string, now time.Time) {
+	if method == "" {
+		method = http.MethodPost
+	}
 	now = now.UTC()
 	date := now.Format("20060102")
 	amzDate := now.Format("20060102T150405Z")
@@ -39,7 +42,7 @@ func signV4(requestURL *url.URL, body []byte, headers http.Header, credentials C
 	}
 	signedHeaders := strings.Join(keys, ";")
 	payloadHash := sha256Hex(body)
-	canonicalRequest := "POST\n" + requestURL.EscapedPath() + "\n" + requestURL.Query().Encode() + "\n" + canonicalHeaders.String() + "\n" + signedHeaders + "\n" + payloadHash
+	canonicalRequest := method + "\n" + requestURL.EscapedPath() + "\n" + requestURL.Query().Encode() + "\n" + canonicalHeaders.String() + "\n" + signedHeaders + "\n" + payloadHash
 	scope := date + "/" + region + "/bedrock/aws4_request"
 	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + sha256Hex([]byte(canonicalRequest))
 	dateKey := hmacSHA256([]byte("AWS4"+credentials.SecretAccessKey), date)

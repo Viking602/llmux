@@ -172,7 +172,7 @@ func (model *model) headers(ctx context.Context, endpoint string, body []byte, o
 		return nil, errors.New("bedrock: credentials provider returned empty credentials")
 	}
 	parsed, _ := url.Parse(endpoint)
-	signV4(parsed, body, headers, credentials, model.provider.config.Region, model.provider.config.Now())
+	signV4(http.MethodPost, parsed, body, headers, credentials, model.provider.config.Region, model.provider.config.Now())
 	return headers, nil
 }
 

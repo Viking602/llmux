@@ -216,3 +216,36 @@ type Provider interface {
 	Name() string
 	LanguageModel(modelID string) (LanguageModel, error)
 }
+
+// ModelInfo is a portable entry from a provider List Models response.
+// Raw retains the provider payload for callers that need extra fields.
+type ModelInfo struct {
+	ID          string          `json:"id"`
+	DisplayName string          `json:"displayName,omitempty"`
+	OwnedBy     string          `json:"ownedBy,omitempty"`
+	Created     int64           `json:"created,omitempty"`
+	Raw         json.RawMessage `json:"raw,omitempty"`
+}
+
+// ModelLister is an optional capability. Providers that expose a models
+// discovery endpoint implement it; others leave the package helper returning
+// ErrorUnsupported.
+type ModelLister interface {
+	ListModels(context.Context) ([]ModelInfo, error)
+}
+
+// ListModels discovers models when p implements ModelLister.
+func ListModels(ctx context.Context, p Provider) ([]ModelInfo, error) {
+	if p == nil {
+		return nil, &ProviderError{Kind: ErrorInvalidRequest, Message: "provider is nil"}
+	}
+	lister, ok := p.(ModelLister)
+	if !ok {
+		return nil, &ProviderError{
+			Provider: p.Name(),
+			Kind:     ErrorUnsupported,
+			Message:  "list models is not supported by this provider",
+		}
+	}
+	return lister.ListModels(ctx)
+}

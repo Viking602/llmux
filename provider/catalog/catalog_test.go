@@ -37,4 +37,25 @@ func TestProviderMatrix(t *testing.T) {
 	if provider, ok := Lookup("tencent_token_plan"); !ok || provider.ID != "tencent-token-plan" {
 		t.Fatalf("underscore alias = %#v/%v", provider, ok)
 	}
+	for _, id := range []string{"openai", "anthropic", "google", "bedrock", "cohere", "mistral", "xai", "groq", "deepseek", "ollama"} {
+		provider, ok := Lookup(id)
+		if !ok || !hasCapability(provider, ListModels) {
+			t.Fatalf("%s should advertise list_models capability", id)
+		}
+	}
+	for _, id := range []string{"voyage", "tavily", "codex", "vertex"} {
+		provider, ok := Lookup(id)
+		if !ok || hasCapability(provider, ListModels) {
+			t.Fatalf("%s should not advertise list_models capability", id)
+		}
+	}
+}
+
+func hasCapability(provider Provider, want Capability) bool {
+	for _, capability := range provider.Capabilities {
+		if capability == want {
+			return true
+		}
+	}
+	return false
 }

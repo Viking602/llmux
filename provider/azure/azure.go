@@ -35,9 +35,13 @@ func New(config Config) (*openai.Provider, error) {
 	if config.WireAPI == openai.Responses {
 		path = "/openai/responses"
 	}
-	endpoint := strings.TrimRight(config.ResourceURL, "/") + path + "?api-version=" + url.QueryEscape(config.APIVersion)
+	resource := strings.TrimRight(config.ResourceURL, "/")
+	endpoint := resource + path + "?api-version=" + url.QueryEscape(config.APIVersion)
+	// Data-plane catalog of accessible base models (not deployment names).
+	listModelsURL := resource + "/openai/models?api-version=" + url.QueryEscape(config.APIVersion)
 	return openai.New(openai.Config{
 		APIKey: config.APIKey, BaseURL: config.ResourceURL, Endpoint: endpoint, APIKeyHeader: "api-key",
 		Headers: config.Headers, Client: config.Client, Retry: config.Retry, WireAPI: config.WireAPI, ProviderName: "azure",
+		ListModelsURL: listModelsURL,
 	})
 }
