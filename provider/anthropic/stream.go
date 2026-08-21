@@ -14,33 +14,42 @@ import (
 )
 
 type blockBuilder struct {
-	kind      string
-	id        string
-	name      string
-	text      strings.Builder
-	signature strings.Builder
-	input     strings.Builder
+	kind          string
+	id            string
+	name          string
+	text          strings.Builder
+	signature     strings.Builder
+	input         strings.Builder
+	suppressInput bool
+	finalized     bool
 }
 
 type messageStream struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	body       io.ReadCloser
-	reader     *internalstream.SSEReader
-	provider   string
-	metadata   llmux.ResponseMetadata
-	includeRaw bool
-	blocks     map[int]*blockBuilder
-	pending    []llmux.Part
-	usage      llmux.Usage
-	finish     llmux.FinishReason
-	rawFinish  string
-	terminal   bool
-	closeOnce  sync.Once
+	ctx           context.Context
+	cancel        context.CancelFunc
+	body          io.ReadCloser
+	reader        *internalstream.SSEReader
+	provider      string
+	metadata      llmux.ResponseMetadata
+	includeRaw    bool
+	blocks        map[int]*blockBuilder
+	pending       []llmux.Part
+	usage         llmux.Usage
+	finish        llmux.FinishReason
+	rawFinish     string
+	terminal      bool
+	closeOnce     sync.Once
+	toolCalls     internalstream.ToolCallTracker
+	toolBudget    internalstream.ToolCallBudget
+	activeToolIDs map[string]int
 }
 
 func newMessageStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, provider string, metadata llmux.ResponseMetadata, includeRaw bool) *messageStream {
-	return &messageStream{ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0), provider: provider, metadata: metadata, includeRaw: includeRaw, blocks: make(map[int]*blockBuilder)}
+	return &messageStream{
+		ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0),
+		provider: provider, metadata: metadata, includeRaw: includeRaw,
+		blocks: make(map[int]*blockBuilder), activeToolIDs: make(map[string]int),
+	}
 }
 
 func (stream *messageStream) Close() error {
@@ -132,6 +141,9 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 		if err := json.Unmarshal(blockRaw, &block); err != nil {
 			return errors.New("invalid Anthropic content_block_start")
 		}
+		if stream.blocks[index] != nil {
+			return fmt.Errorf("Anthropic content block index %d was started more than once", index)
+		}
 		builder := &blockBuilder{kind: block.Type, id: block.ID, name: block.Name}
 		stream.blocks[index] = builder
 		switch block.Type {
@@ -148,10 +160,33 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartReasoningDelta, ID: fmt.Sprint(index), Delta: block.Thinking})
 			}
 		case "tool_use", "server_tool_use":
-			if len(block.Input) > 0 && string(block.Input) != "{}" {
-				builder.input.Write(block.Input)
+			if err := stream.toolBudget.Begin(); err != nil {
+				return fmt.Errorf("Anthropic %w", err)
 			}
-			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: block.ID, ToolName: block.Name})
+			if err := stream.toolBudget.AddAlias(block.ID); err != nil {
+				return fmt.Errorf("Anthropic %w", err)
+			}
+			if err := stream.toolBudget.AddMetadata(block.Name); err != nil {
+				return fmt.Errorf("Anthropic %w", err)
+			}
+			if block.ID != "" {
+				if activeIndex, exists := stream.activeToolIDs[block.ID]; exists {
+					return fmt.Errorf("Anthropic tool call ID %q is already active at block %d", block.ID, activeIndex)
+				}
+				if stream.activeToolIDs == nil {
+					stream.activeToolIDs = make(map[string]int)
+				}
+				stream.activeToolIDs[block.ID] = index
+			}
+			builder.suppressInput = stream.toolCalls.Seen(block.ID)
+			if len(block.Input) > 0 && string(block.Input) != "{}" {
+				if err := stream.toolBudget.AppendArguments(&builder.input, string(block.Input)); err != nil {
+					return fmt.Errorf("Anthropic %w", err)
+				}
+			}
+			if !builder.suppressInput {
+				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: block.ID, ToolName: block.Name})
+			}
 		case "redacted_thinking":
 			builder.text.WriteString(block.Data)
 		}
@@ -159,6 +194,9 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 		builder := stream.blocks[index]
 		if builder == nil {
 			return fmt.Errorf("Anthropic delta for unknown block %d", index)
+		}
+		if builder.finalized {
+			return fmt.Errorf("Anthropic delta for finalized block %d", index)
 		}
 		var delta struct {
 			Type        string `json:"type"`
@@ -180,13 +218,20 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 		case "signature_delta":
 			builder.signature.WriteString(delta.Signature)
 		case "input_json_delta":
-			builder.input.WriteString(delta.PartialJSON)
-			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: builder.id, Delta: delta.PartialJSON})
+			if err := stream.toolBudget.AppendArguments(&builder.input, delta.PartialJSON); err != nil {
+				return fmt.Errorf("Anthropic %w", err)
+			}
+			if !builder.suppressInput {
+				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: builder.id, Delta: delta.PartialJSON})
+			}
 		}
 	case "content_block_stop":
 		builder := stream.blocks[index]
 		if builder == nil {
 			return fmt.Errorf("Anthropic stop for unknown block %d", index)
+		}
+		if builder.finalized {
+			return nil
 		}
 		switch builder.kind {
 		case "text":
@@ -201,9 +246,18 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 			if !json.Valid(arguments) {
 				return fmt.Errorf("Anthropic tool call %q has invalid input", builder.id)
 			}
+			delete(stream.activeToolIDs, builder.id)
+			accepted, err := stream.toolCalls.Accept(builder.id, builder.name, arguments)
+			if err != nil {
+				return fmt.Errorf("Anthropic %w", err)
+			}
+			if !accepted {
+				break
+			}
 			call := &llmux.ToolCall{ID: builder.id, Name: builder.name, Arguments: arguments}
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputEnd, ID: builder.id}, llmux.Part{Kind: llmux.PartToolCall, ID: builder.id, ToolCall: call})
 		}
+		builder.finalized = true
 	case "message_delta":
 		var delta struct {
 			StopReason string `json:"stop_reason"`
@@ -276,9 +330,11 @@ func (stream *messageStream) pop() (llmux.Part, bool) {
 }
 
 func (stream *messageStream) fail(err error) (llmux.Part, error) {
+	contextErr := stream.ctx.Err()
 	stream.terminal = true
+	stream.pending = nil
 	_ = stream.Close()
-	if contextErr := stream.ctx.Err(); contextErr != nil {
+	if contextErr != nil {
 		return llmux.Part{}, contextErr
 	}
 	var providerError *llmux.ProviderError

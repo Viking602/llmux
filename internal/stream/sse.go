@@ -79,18 +79,23 @@ func (reader *SSEReader) Next() (SSEEvent, error) {
 }
 
 func (reader *SSEReader) readLine() (string, error) {
-	line, err := reader.reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", err
+	line := make([]byte, 0, min(reader.maxBytes, 4096))
+	for {
+		fragment, prefix, err := reader.reader.ReadLine()
+		if err != nil {
+			if errors.Is(err, io.EOF) && len(line) > 0 {
+				return string(line), nil
+			}
+			return "", err
+		}
+		if len(fragment) > reader.maxBytes-len(line) {
+			return "", fmt.Errorf("llmux: SSE line exceeds %d bytes", reader.maxBytes)
+		}
+		line = append(line, fragment...)
+		if !prefix {
+			return string(line), nil
+		}
 	}
-	if errors.Is(err, io.EOF) && line == "" {
-		return "", io.EOF
-	}
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	// A final unterminated line still belongs to the current frame. Returning
-	// it first lets Next classify the unfinished frame on the following EOF.
-	return line, nil
 }
 
 func splitField(line string) (string, string) {

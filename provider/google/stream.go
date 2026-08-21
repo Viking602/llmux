@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -13,25 +14,27 @@ import (
 )
 
 type geminiStream struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	body             io.ReadCloser
-	reader           *internalstream.SSEReader
-	provider         string
-	metadata         llmux.ResponseMetadata
-	warnings         []string
-	includeRaw       bool
-	pending          []llmux.Part
-	usage            llmux.Usage
-	finish           llmux.FinishReason
-	rawFinish        string
-	providerParts    []json.RawMessage
-	textStarted      bool
-	reasoningStarted bool
-	completed        bool
-	toolUse          bool
-	terminal         bool
-	closeOnce        sync.Once
+	ctx                context.Context
+	cancel             context.CancelFunc
+	body               io.ReadCloser
+	reader             *internalstream.SSEReader
+	provider           string
+	metadata           llmux.ResponseMetadata
+	warnings           []string
+	includeRaw         bool
+	pending            []llmux.Part
+	usage              llmux.Usage
+	finish             llmux.FinishReason
+	rawFinish          string
+	providerStateBytes int
+	providerParts      []json.RawMessage
+	textStarted        bool
+	reasoningStarted   bool
+	completed          bool
+	toolUse            bool
+	terminal           bool
+	closeOnce          sync.Once
+	toolCalls          internalstream.ToolCallTracker
 }
 
 func newGeminiStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, provider string, metadata llmux.ResponseMetadata, warnings []string, includeRaw bool) *geminiStream {
@@ -89,9 +92,16 @@ func (stream *geminiStream) Recv() (llmux.Part, error) {
 		if chunk.UsageMetadata.TotalTokenCount > 0 || chunk.UsageMetadata.PromptTokenCount > 0 || chunk.UsageMetadata.CandidatesTokenCount > 0 {
 			stream.usage = convertUsage(chunk.UsageMetadata)
 		}
+		if stream.completed && len(chunk.Candidates) > 0 {
+			return stream.fail(errors.New("Google candidate arrived after terminal finish reason"))
+		}
 		if len(chunk.Candidates) > 0 {
 			candidate := chunk.Candidates[0]
 			for _, raw := range candidate.Content.Parts {
+				if len(raw) > internalstream.MaxTrackedToolCallBytes-stream.providerStateBytes {
+					return stream.fail(fmt.Errorf("Google provider state exceeds %d bytes", internalstream.MaxTrackedToolCallBytes))
+				}
+				stream.providerStateBytes += len(raw)
 				stream.providerParts = append(stream.providerParts, append(json.RawMessage(nil), raw...))
 				var part struct {
 					Text         *string `json:"text"`
@@ -133,8 +143,14 @@ func (stream *geminiStream) Recv() (llmux.Part, error) {
 					if !json.Valid(arguments) {
 						return stream.fail(errors.New("Google streamed invalid function arguments"))
 					}
-					call := &llmux.ToolCall{ID: part.FunctionCall.ID, Name: part.FunctionCall.Name, Arguments: arguments}
-					stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: call.ID, ToolName: call.Name}, llmux.Part{Kind: llmux.PartToolInputDelta, ID: call.ID, Delta: string(arguments)}, llmux.Part{Kind: llmux.PartToolInputEnd, ID: call.ID}, llmux.Part{Kind: llmux.PartToolCall, ID: call.ID, ToolCall: call})
+					accepted, err := stream.toolCalls.Accept(part.FunctionCall.ID, part.FunctionCall.Name, arguments)
+					if err != nil {
+						return stream.fail(fmt.Errorf("Google %w", err))
+					}
+					if accepted {
+						call := &llmux.ToolCall{ID: part.FunctionCall.ID, Name: part.FunctionCall.Name, Arguments: arguments}
+						stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: call.ID, ToolName: call.Name}, llmux.Part{Kind: llmux.PartToolInputDelta, ID: call.ID, Delta: string(arguments)}, llmux.Part{Kind: llmux.PartToolInputEnd, ID: call.ID}, llmux.Part{Kind: llmux.PartToolCall, ID: call.ID, ToolCall: call})
+					}
 				}
 				if part.InlineData != nil {
 					result := llmux.Result{}
@@ -178,9 +194,11 @@ func (stream *geminiStream) pop() (llmux.Part, bool) {
 }
 
 func (stream *geminiStream) fail(err error) (llmux.Part, error) {
+	contextErr := stream.ctx.Err()
 	stream.terminal = true
+	stream.pending = nil
 	_ = stream.Close()
-	if contextErr := stream.ctx.Err(); contextErr != nil {
+	if contextErr != nil {
 		return llmux.Part{}, contextErr
 	}
 	providerError := &llmux.ProviderError{Provider: stream.provider, Kind: llmux.ErrorStream, Message: err.Error(), Cause: err}

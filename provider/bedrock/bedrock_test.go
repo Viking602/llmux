@@ -61,3 +61,42 @@ func encodeEvent(messageType, eventType, payload string) []byte {
 	binary.BigEndian.PutUint32(frame[total-4:], crc32.ChecksumIEEE(frame[:total-4]))
 	return frame
 }
+
+func TestToolBlockFinalizationIsIdempotent(t *testing.T) {
+	stream := &converseStream{blocks: make(map[int]*blockBuilder)}
+	events := []eventMessage{
+		{EventType: "contentBlockStart", Payload: []byte(`{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"","name":"lookup"}}}`)},
+		{EventType: "contentBlockDelta", Payload: []byte(`{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"x\":1}"}}}`)},
+		{EventType: "contentBlockStop", Payload: []byte(`{"contentBlockIndex":0}`)},
+	}
+	for _, event := range events[:2] {
+		if err := stream.mapEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 2 {
+		if err := stream.mapEvent(events[2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counts := make(map[llmux.PartKind]int)
+	for _, part := range stream.pending {
+		counts[part.Kind]++
+	}
+	for _, kind := range []llmux.PartKind{llmux.PartToolInputStart, llmux.PartToolInputDelta, llmux.PartToolInputEnd, llmux.PartToolCall} {
+		if counts[kind] != 1 {
+			t.Fatalf("%s parts = %d, want 1", kind, counts[kind])
+		}
+	}
+}
+
+func TestContentBlockIndexCannotBeRebound(t *testing.T) {
+	stream := &converseStream{blocks: make(map[int]*blockBuilder)}
+	start := eventMessage{EventType: "contentBlockStart", Payload: []byte(`{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"call-1","name":"lookup"}}}`)}
+	if err := stream.mapEvent(start); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.mapEvent(start); err == nil {
+		t.Fatal("Bedrock content block index was rebound")
+	}
+}

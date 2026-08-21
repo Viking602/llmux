@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Viking602/llmux"
@@ -125,5 +126,57 @@ func TestMaxTokensDefaultsAndOverrides(t *testing.T) {
 
 	if len(got) != 3 || got[0] != DefaultMaxOutputTokens || got[1] != 384000 || got[2] != 2048 {
 		t.Fatalf("max_tokens sequence = %v, want [%d 384000 2048]", got, DefaultMaxOutputTokens)
+	}
+}
+
+func TestToolBlockFinalizationIsIdempotent(t *testing.T) {
+	stream := &messageStream{blocks: make(map[int]*blockBuilder)}
+	start := json.RawMessage(`{"type":"tool_use","id":"","name":"lookup","input":{}}`)
+	delta := json.RawMessage(`{"type":"input_json_delta","partial_json":"{\"x\":1}"}`)
+	if err := stream.mapEvent("content_block_start", 0, nil, start, nil, usage{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.mapEvent("content_block_delta", 0, nil, nil, delta, usage{}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := stream.mapEvent("content_block_stop", 0, nil, nil, nil, usage{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counts := make(map[llmux.PartKind]int)
+	for _, part := range stream.pending {
+		counts[part.Kind]++
+	}
+	for _, kind := range []llmux.PartKind{llmux.PartToolInputStart, llmux.PartToolInputDelta, llmux.PartToolInputEnd, llmux.PartToolCall} {
+		if counts[kind] != 1 {
+			t.Fatalf("%s parts = %d, want 1", kind, counts[kind])
+		}
+	}
+}
+
+func TestThinkingSignatureDeltaPersists(t *testing.T) {
+	stream := &messageStream{blocks: map[int]*blockBuilder{0: {kind: "thinking"}}}
+	delta := json.RawMessage(`{"type":"signature_delta","signature":"sig-1"}`)
+	if err := stream.mapEvent("content_block_delta", 0, nil, nil, delta, usage{}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := stream.providerState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(state), `"signature":"sig-1"`) {
+		t.Fatalf("provider state = %s", state)
+	}
+}
+
+func TestContentBlockIndexCannotBeRebound(t *testing.T) {
+	stream := &messageStream{blocks: make(map[int]*blockBuilder)}
+	start := json.RawMessage(`{"type":"tool_use","id":"call-1","name":"lookup","input":{}}`)
+	if err := stream.mapEvent("content_block_start", 0, nil, start, nil, usage{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.mapEvent("content_block_start", 0, nil, start, nil, usage{}); err == nil {
+		t.Fatal("Anthropic content block index was rebound")
 	}
 }
