@@ -14,11 +14,11 @@ import (
 )
 
 type toolBuilder struct {
-	id        string
-	name      string
-	arguments strings.Builder
+	id            string
+	name          string
+	arguments     strings.Builder
+	suppressInput bool
 }
-
 type chatStream struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -26,7 +26,10 @@ type chatStream struct {
 	reader           *internalstream.SSEReader
 	includeRaw       bool
 	pending          []llmux.Part
-	tool             *toolBuilder
+	tools            map[int]*toolBuilder
+	startedIndexes   map[int]bool
+	completedIndexes map[int]bool
+	activeToolIDs    map[string]int
 	usage            llmux.Usage
 	finish           llmux.FinishReason
 	rawFinish        string
@@ -34,10 +37,17 @@ type chatStream struct {
 	completed        bool
 	terminal         bool
 	closeOnce        sync.Once
+	toolCalls        internalstream.ToolCallTracker
+	toolBudget       internalstream.ToolCallBudget
 }
 
 func newChatStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, includeRaw bool) *chatStream {
-	return &chatStream{ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0), includeRaw: includeRaw, reasoningIndexes: make(map[int]bool)}
+	return &chatStream{
+		ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0), includeRaw: includeRaw,
+		tools: make(map[int]*toolBuilder), startedIndexes: make(map[int]bool),
+		completedIndexes: make(map[int]bool), activeToolIDs: make(map[string]int),
+		reasoningIndexes: make(map[int]bool),
+	}
 }
 
 func (stream *chatStream) Close() error {
@@ -95,6 +105,9 @@ func (stream *chatStream) Recv() (llmux.Part, error) {
 		if stream.includeRaw {
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartRaw, Raw: []byte(data)})
 		}
+		if stream.completed {
+			return stream.fail(fmt.Errorf("Cohere event %q arrived after message-end", event.Type))
+		}
 		switch event.Type {
 		case "message-start":
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartResponseMetadata, Response: llmux.ResponseMetadata{ID: event.ID}})
@@ -118,34 +131,78 @@ func (stream *chatStream) Recv() (llmux.Part, error) {
 				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartTextEnd, ID: indexID(event.Index)})
 			}
 		case "tool-call-start":
+			if stream.startedIndexes[event.Index] {
+				return stream.fail(fmt.Errorf("Cohere tool index %d was started more than once", event.Index))
+			}
+			if err := stream.toolBudget.Begin(); err != nil {
+				return stream.fail(fmt.Errorf("Cohere %w", err))
+			}
 			function, _ := event.Delta.Message.ToolCalls["function"].(map[string]any)
-			stream.tool = &toolBuilder{id: stringValue(event.Delta.Message.ToolCalls["id"]), name: stringValue(function["name"])}
+			builder := &toolBuilder{id: stringValue(event.Delta.Message.ToolCalls["id"]), name: stringValue(function["name"])}
+			if err := stream.toolBudget.AddAlias(builder.id); err != nil {
+				return stream.fail(fmt.Errorf("Cohere %w", err))
+			}
+			if err := stream.toolBudget.AddMetadata(builder.name); err != nil {
+				return stream.fail(fmt.Errorf("Cohere %w", err))
+			}
+			if builder.id != "" {
+				if activeIndex, exists := stream.activeToolIDs[builder.id]; exists {
+					return stream.fail(fmt.Errorf("Cohere tool call ID %q is already active at index %d", builder.id, activeIndex))
+				}
+				stream.activeToolIDs[builder.id] = event.Index
+			}
+			builder.suppressInput = stream.toolCalls.Seen(builder.id)
 			initial := stringValue(function["arguments"])
-			stream.tool.arguments.WriteString(initial)
-			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: stream.tool.id, ToolName: stream.tool.name})
-			if initial != "" {
-				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: stream.tool.id, Delta: initial})
+			if err := stream.toolBudget.AppendArguments(&builder.arguments, initial); err != nil {
+				return stream.fail(fmt.Errorf("Cohere %w", err))
+			}
+			stream.tools[event.Index] = builder
+			stream.startedIndexes[event.Index] = true
+			if !builder.suppressInput {
+				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: builder.id, ToolName: builder.name})
+				if initial != "" {
+					stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: builder.id, Delta: initial})
+				}
 			}
 		case "tool-call-delta":
-			if stream.tool != nil {
-				function, _ := event.Delta.Message.ToolCalls["function"].(map[string]any)
-				delta := stringValue(function["arguments"])
-				stream.tool.arguments.WriteString(delta)
-				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: stream.tool.id, Delta: delta})
+			builder := stream.tools[event.Index]
+			if builder == nil {
+				return stream.fail(fmt.Errorf("Cohere tool delta for unknown index %d", event.Index))
+			}
+			function, _ := event.Delta.Message.ToolCalls["function"].(map[string]any)
+			delta := stringValue(function["arguments"])
+			if err := stream.toolBudget.AppendArguments(&builder.arguments, delta); err != nil {
+				return stream.fail(fmt.Errorf("Cohere %w", err))
+			}
+			if !builder.suppressInput {
+				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: builder.id, Delta: delta})
 			}
 		case "tool-call-end":
-			if stream.tool != nil {
-				arguments := json.RawMessage(stream.tool.arguments.String())
-				if len(arguments) == 0 || string(arguments) == "null" {
-					arguments = json.RawMessage(`{}`)
-				}
-				if !json.Valid(arguments) {
-					return stream.fail(errors.New("Cohere streamed invalid tool arguments"))
-				}
-				call := &llmux.ToolCall{ID: stream.tool.id, Name: stream.tool.name, Arguments: arguments}
-				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputEnd, ID: call.ID}, llmux.Part{Kind: llmux.PartToolCall, ID: call.ID, ToolCall: call})
-				stream.tool = nil
+			if stream.completedIndexes[event.Index] {
+				break
 			}
+			builder := stream.tools[event.Index]
+			if builder == nil {
+				return stream.fail(fmt.Errorf("Cohere tool end for unknown index %d", event.Index))
+			}
+			arguments := json.RawMessage(builder.arguments.String())
+			if len(arguments) == 0 || string(arguments) == "null" {
+				arguments = json.RawMessage(`{}`)
+			}
+			if !json.Valid(arguments) {
+				return stream.fail(errors.New("Cohere streamed invalid tool arguments"))
+			}
+			accepted, err := stream.toolCalls.Accept(builder.id, builder.name, arguments)
+			if err != nil {
+				return stream.fail(fmt.Errorf("Cohere %w", err))
+			}
+			if accepted {
+				call := &llmux.ToolCall{ID: builder.id, Name: builder.name, Arguments: arguments}
+				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputEnd, ID: call.ID}, llmux.Part{Kind: llmux.PartToolCall, ID: call.ID, ToolCall: call})
+			}
+			delete(stream.activeToolIDs, builder.id)
+			delete(stream.tools, event.Index)
+			stream.completedIndexes[event.Index] = true
 		case "message-end":
 			stream.rawFinish = event.Delta.FinishReason
 			stream.finish = finishReason(stream.rawFinish)
@@ -177,9 +234,11 @@ func (stream *chatStream) popOrEOF() (llmux.Part, error) {
 }
 
 func (stream *chatStream) fail(err error) (llmux.Part, error) {
+	contextErr := stream.ctx.Err()
 	stream.terminal = true
+	stream.pending = nil
 	_ = stream.Close()
-	if contextErr := stream.ctx.Err(); contextErr != nil {
+	if contextErr != nil {
 		return llmux.Part{}, contextErr
 	}
 	providerError := &llmux.ProviderError{Provider: "cohere", Kind: llmux.ErrorStream, Message: err.Error(), Cause: err}

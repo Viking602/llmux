@@ -32,3 +32,10 @@ func TestSSEReaderBoundsFrame(t *testing.T) {
 		t.Fatal("expected frame size error")
 	}
 }
+
+func TestSSEReaderRejectsOversizedUnterminatedLine(t *testing.T) {
+	reader := NewSSEReader(strings.NewReader("data: "+strings.Repeat("x", 65)), 64)
+	if _, err := reader.Next(); err == nil || !strings.Contains(err.Error(), "SSE line exceeds 64 bytes") {
+		t.Fatalf("error = %v", err)
+	}
+}

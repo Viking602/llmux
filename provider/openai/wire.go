@@ -712,11 +712,12 @@ func parseResponsesResult(payload []byte) (llmux.Result, error) {
 	result.Usage = mapResponsesUsage(response.Usage)
 	for _, raw := range response.Output {
 		var item struct {
-			Type      string `json:"type"`
-			ID        string `json:"id"`
-			CallID    string `json:"call_id"`
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
+			Type      string  `json:"type"`
+			ID        string  `json:"id"`
+			CallID    string  `json:"call_id"`
+			Name      string  `json:"name"`
+			Input     *string `json:"input"`
+			Arguments string  `json:"arguments"`
 			Summary   []struct {
 				Text string `json:"text"`
 			} `json:"summary"`
@@ -739,12 +740,20 @@ func parseResponsesResult(payload []byte) (llmux.Result, error) {
 			for _, block := range item.Summary {
 				result.Reasoning += block.Text
 			}
-		case "function_call", "custom_tool_call":
+		case "function_call":
 			arguments := json.RawMessage(item.Arguments)
 			if !json.Valid(arguments) {
 				return llmux.Result{}, fmt.Errorf("tool call %q has invalid JSON arguments", item.CallID)
 			}
 			call := llmux.ToolCall{ID: first(item.CallID, item.ID), Name: item.Name, Arguments: arguments}
+			result.ToolCalls = append(result.ToolCalls, call)
+			result.Content = append(result.Content, llmux.ContentPart{Kind: llmux.ContentToolCall, ToolCall: &call})
+		case "custom_tool_call":
+			input := ""
+			if item.Input != nil {
+				input = *item.Input
+			}
+			call := llmux.ToolCall{ID: first(item.CallID, item.ID), Name: item.Name, Arguments: customToolArguments(input)}
 			result.ToolCalls = append(result.ToolCalls, call)
 			result.Content = append(result.Content, llmux.ContentPart{Kind: llmux.ContentToolCall, ToolCall: &call})
 		}

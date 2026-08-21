@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 
@@ -48,6 +49,7 @@ func (stream *streamBase) pop() (llmux.Part, bool) {
 func (stream *streamBase) fail(err error) (llmux.Part, error) {
 	contextErr := stream.ctx.Err()
 	stream.terminal = true
+	stream.pending = nil
 	_ = stream.Close()
 	if contextErr != nil {
 		return llmux.Part{}, contextErr
@@ -57,9 +59,17 @@ func (stream *streamBase) fail(err error) (llmux.Part, error) {
 }
 
 type toolBuilder struct {
-	id        string
-	name      string
-	arguments strings.Builder
+	id             string
+	callID         string
+	identity       string
+	kind           string
+	name           string
+	arguments      strings.Builder
+	argumentsDone  bool
+	emitted        bool
+	emittedID      string
+	outputIndex    int
+	hasOutputIndex bool
 }
 
 type chatStream struct {
@@ -71,6 +81,10 @@ type chatStream struct {
 	profile          CompatProfile
 	textStarted      bool
 	reasoningStarted bool
+	finalized        bool
+	toolCalls        internalstream.ToolCallTracker
+	toolBudget       internalstream.ToolCallBudget
+	activeToolIDs    map[string]int
 }
 
 func newChatStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, provider string, metadata llmux.ResponseMetadata, includeRaw bool, profile CompatProfile, warnings []string) *chatStream {
@@ -179,17 +193,48 @@ func (stream *chatStream) Recv() (llmux.Part, error) {
 			}
 			for _, delta := range choice.Delta.ToolCalls {
 				builder := stream.tools[delta.Index]
-				if builder == nil {
+				created := builder == nil
+				if created {
+					if err := stream.toolBudget.Begin(); err != nil {
+						return stream.fail(fmt.Errorf("chat %w", err))
+					}
 					builder = &toolBuilder{}
 					stream.tools[delta.Index] = builder
-					stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: delta.ID, ToolName: delta.Function.Name})
 				}
 				if delta.ID != "" {
+					if builder.id != "" && builder.id != delta.ID {
+						return stream.fail(fmt.Errorf("chat tool index %d changed call ID from %q to %q", delta.Index, builder.id, delta.ID))
+					}
+					if activeIndex, exists := stream.activeToolIDs[delta.ID]; exists && activeIndex != delta.Index {
+						return stream.fail(fmt.Errorf("chat tool call ID %q is already active at index %d", delta.ID, activeIndex))
+					}
+					if builder.id == "" {
+						if err := stream.toolBudget.AddAlias(delta.ID); err != nil {
+							return stream.fail(fmt.Errorf("chat %w", err))
+						}
+						if stream.activeToolIDs == nil {
+							stream.activeToolIDs = make(map[string]int)
+						}
+						stream.activeToolIDs[delta.ID] = delta.Index
+					}
 					builder.id = delta.ID
 				}
-				builder.name += delta.Function.Name
+				if delta.Function.Name != "" {
+					if len(builder.name)+len(delta.Function.Name) > internalstream.MaxToolMetadataBytes {
+						return stream.fail(fmt.Errorf("chat tool name exceeds %d bytes", internalstream.MaxToolMetadataBytes))
+					}
+					if err := stream.toolBudget.AddMetadata(delta.Function.Name); err != nil {
+						return stream.fail(fmt.Errorf("chat %w", err))
+					}
+					builder.name += delta.Function.Name
+				}
+				if created {
+					stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: builder.id, ToolName: builder.name})
+				}
 				if delta.Function.Arguments != "" {
-					builder.arguments.WriteString(delta.Function.Arguments)
+					if err := stream.toolBudget.AppendArguments(&builder.arguments, delta.Function.Arguments); err != nil {
+						return stream.fail(fmt.Errorf("chat %w", err))
+					}
 					stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: builder.id, Delta: delta.Function.Arguments})
 				}
 			}
@@ -205,13 +250,22 @@ func (stream *chatStream) Recv() (llmux.Part, error) {
 }
 
 func (stream *chatStream) finishParts() {
+	if stream.finalized {
+		return
+	}
+	stream.finalized = true
 	if stream.textStarted {
 		stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartTextEnd, ID: "text-0"})
 	}
 	if stream.reasoningStarted {
 		stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartReasoningEnd, ID: "reasoning-0"})
 	}
-	for index := 0; index < len(stream.tools); index++ {
+	indexes := make([]int, 0, len(stream.tools))
+	for index := range stream.tools {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	for _, index := range indexes {
 		builder := stream.tools[index]
 		if builder == nil {
 			continue
@@ -222,6 +276,14 @@ func (stream *chatStream) finishParts() {
 		}
 		if !json.Valid(arguments) {
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartError, Err: &llmux.ProviderError{Provider: stream.provider, Kind: llmux.ErrorStream, Message: "tool call has invalid JSON arguments"}})
+			continue
+		}
+		accepted, err := stream.toolCalls.Accept(builder.id, builder.name, arguments)
+		if err != nil {
+			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartError, Err: &llmux.ProviderError{Provider: stream.provider, Kind: llmux.ErrorStream, Message: err.Error()}})
+			continue
+		}
+		if !accepted {
 			continue
 		}
 		call := &llmux.ToolCall{ID: builder.id, Name: builder.name, Arguments: arguments}
@@ -242,18 +304,31 @@ func (stream *chatStream) popOrEOF() (llmux.Part, error) {
 
 type responsesStream struct {
 	streamBase
-	tools            map[string]*toolBuilder
-	emitted          map[string]bool
-	usage            llmux.Usage
-	providerState    json.RawMessage
-	finish           llmux.FinishReason
-	rawFinish        string
-	textStarted      bool
-	reasoningStarted bool
+	tools                 []*toolBuilder
+	toolsByOutputIndex    map[int]*toolBuilder
+	toolsByItemID         map[string]*toolBuilder
+	toolsByCallID         map[string]*toolBuilder
+	toolsByPrefixedCallID map[string]*toolBuilder
+	toolArguments         internalstream.ToolCallTracker
+	toolCalls             internalstream.ToolCallTracker
+	toolBudget            internalstream.ToolCallBudget
+	usage                 llmux.Usage
+	completed             bool
+	providerState         json.RawMessage
+	finish                llmux.FinishReason
+	rawFinish             string
+	textStarted           bool
+	reasoningStarted      bool
 }
 
 func newResponsesStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, provider string, metadata llmux.ResponseMetadata, includeRaw bool, warnings []string) *responsesStream {
-	return &responsesStream{streamBase: streamBase{ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0), provider: provider, metadata: metadata, includeRaw: includeRaw, warnings: warnings}, tools: make(map[string]*toolBuilder), emitted: make(map[string]bool)}
+	return &responsesStream{
+		streamBase:            streamBase{ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0), provider: provider, metadata: metadata, includeRaw: includeRaw, warnings: warnings},
+		toolsByOutputIndex:    make(map[int]*toolBuilder),
+		toolsByItemID:         make(map[string]*toolBuilder),
+		toolsByCallID:         make(map[string]*toolBuilder),
+		toolsByPrefixedCallID: make(map[string]*toolBuilder),
+	}
 }
 
 func (stream *responsesStream) Recv() (llmux.Part, error) {
@@ -293,6 +368,7 @@ func (stream *responsesStream) Recv() (llmux.Part, error) {
 			Delta       string          `json:"delta"`
 			Text        string          `json:"text"`
 			Name        string          `json:"name"`
+			Input       string          `json:"input"`
 			Arguments   json.RawMessage `json:"arguments"`
 			ItemID      string          `json:"item_id"`
 			CallID      string          `json:"call_id"`
@@ -312,7 +388,7 @@ func (stream *responsesStream) Recv() (llmux.Part, error) {
 		if stream.includeRaw {
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartRaw, Raw: []byte(data)})
 		}
-		if err := stream.mapEvent(event.Type, event.Delta, event.Name, event.ItemID, event.CallID, event.OutputIndex, event.Arguments, event.Item, event.Response, []byte(data)); err != nil {
+		if err := stream.mapEvent(event.Type, event.Delta, event.Name, event.Input, event.ItemID, event.CallID, event.OutputIndex, event.Arguments, event.Item, event.Response, []byte(data)); err != nil {
 			return stream.fail(err)
 		}
 		if part, ok := stream.pop(); ok {
@@ -321,7 +397,10 @@ func (stream *responsesStream) Recv() (llmux.Part, error) {
 	}
 }
 
-func (stream *responsesStream) mapEvent(eventType, delta, name, itemID, callID string, outputIndex *int, arguments, itemRaw, responseRaw, raw []byte) error {
+func (stream *responsesStream) mapEvent(eventType, delta, name, input, itemID, callID string, outputIndex *int, arguments, itemRaw, responseRaw, raw []byte) error {
+	if stream.completed && eventType != "response.completed" && isResponsesToolLifecycleEvent(eventType) {
+		return fmt.Errorf("Responses tool event %q arrived after response.completed", eventType)
+	}
 	switch eventType {
 	case "response.created", "response.in_progress":
 		if len(responseRaw) > 0 && stream.metadata.ID == "" {
@@ -352,35 +431,86 @@ func (stream *responsesStream) mapEvent(eventType, delta, name, itemID, callID s
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartReasoningDelta, ID: "reasoning-0", Delta: delta})
 		}
 	case "response.output_item.added":
-		var item responseItem
-		if json.Unmarshal(itemRaw, &item) == nil && isToolItem(item.Type) {
-			stream.updateTool(item, outputIndex, false)
+		item, toolItem, err := decodeResponseToolItem(itemRaw)
+		if err != nil {
+			return err
+		}
+		if toolItem {
+			_, err = stream.updateTool(item, outputIndex, false)
+			return err
 		}
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-		builder := stream.tool(itemID, callID, outputIndex)
-		if name != "" {
-			builder.name = name
+		builder, err := stream.tool(itemID, callID, outputIndex)
+		if err != nil {
+			return err
 		}
-		builder.arguments.WriteString(delta)
+		eventKind := "function_call"
+		if eventType == "response.custom_tool_call_input.delta" {
+			eventKind = "custom_tool_call"
+		}
+		if builder.kind != "" && builder.kind != eventKind {
+			return fmt.Errorf("Responses tool call identity %q changed kind from %q to %q", builder.identity, builder.kind, eventKind)
+		}
+		builder.kind = eventKind
+		if builder.argumentsDone {
+			return fmt.Errorf("Responses tool call identity %q received arguments after finalization", builder.identity)
+		}
+		if err := stream.setToolName(builder, name); err != nil {
+			return err
+		}
+		if err := stream.toolBudget.AppendArguments(&builder.arguments, delta); err != nil {
+			return fmt.Errorf("Responses %w", err)
+		}
 		stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: first(builder.id, callID, itemID), Delta: delta})
-	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
-		builder := stream.tool(itemID, callID, outputIndex)
-		if name != "" {
-			builder.name = name
+	case "response.function_call_arguments.done":
+		builder, err := stream.toolForTerminalEvent(itemID, callID, outputIndex)
+		if err != nil {
+			return err
 		}
-		if len(arguments) > 0 {
-			argumentText, err := decodeArguments(arguments)
+		if builder.kind != "" && builder.kind != "function_call" {
+			return fmt.Errorf("Responses tool call identity %q changed kind from %q to function_call", builder.identity, builder.kind)
+		}
+		builder.kind = "function_call"
+		argumentText, err := decodeArguments(arguments)
+		if err != nil {
+			return err
+		}
+		return stream.finalizeToolArguments(builder, name, json.RawMessage(argumentText))
+	case "response.custom_tool_call_input.done":
+		builder, err := stream.toolForTerminalEvent(itemID, callID, outputIndex)
+		if err != nil {
+			return err
+		}
+		if builder.kind != "" && builder.kind != "custom_tool_call" {
+			return fmt.Errorf("Responses tool call identity %q changed kind from %q to custom_tool_call", builder.identity, builder.kind)
+		}
+		builder.kind = "custom_tool_call"
+		return stream.finalizeToolArguments(builder, name, customToolArguments(input))
+	case "response.output_item.done":
+		item, toolItem, err := decodeResponseToolItem(itemRaw)
+		if err != nil {
+			return err
+		}
+		if toolItem {
+			if stream.completed {
+				existing, err := stream.lookupTool(item.ID, item.CallID, outputIndex)
+				if err != nil {
+					return err
+				}
+				if existing == nil {
+					return errors.New("Responses output_item.done introduced a tool call after response.completed")
+				}
+				if !existing.emitted {
+					return errors.New("Responses output_item.done finalized an uncommitted tool call after response.completed")
+				}
+			}
+			builder, err := stream.updateTool(item, outputIndex, true)
 			if err != nil {
 				return err
 			}
-			builder.arguments.Reset()
-			builder.arguments.WriteString(argumentText)
-		}
-		return stream.emitTool(builder)
-	case "response.output_item.done":
-		var item responseItem
-		if json.Unmarshal(itemRaw, &item) == nil && isToolItem(item.Type) {
-			builder := stream.updateTool(item, outputIndex, true)
+			if builder.callID == "" {
+				return nil
+			}
 			return stream.emitTool(builder)
 		}
 	case "response.completed":
@@ -388,7 +518,47 @@ func (stream *responsesStream) mapEvent(eventType, delta, name, itemID, callID s
 		if err := json.Unmarshal(responseRaw, &response); err != nil {
 			return errors.New("invalid response.completed payload")
 		}
-		stream.providerState = mustMarshal(response.Output)
+		providerState := mustMarshal(response.Output)
+		builders := make([]*toolBuilder, 0, len(response.Output))
+		for index, rawItem := range response.Output {
+			item, toolItem, err := decodeResponseToolItem(rawItem)
+			if err != nil {
+				return err
+			}
+			if !toolItem {
+				continue
+			}
+			if stream.completed {
+				existing, err := stream.lookupTool(item.ID, item.CallID, &index)
+				if err != nil {
+					return err
+				}
+				if existing == nil {
+					return fmt.Errorf("Responses repeated response.completed introduced a new tool call at output index %d", index)
+				}
+				if !existing.emitted {
+					return fmt.Errorf("Responses repeated response.completed finalized an uncommitted tool call at output index %d", index)
+				}
+			}
+			builder, err := stream.updateTool(item, &index, true)
+			if err != nil {
+				return err
+			}
+			builders = append(builders, builder)
+		}
+		for _, builder := range builders {
+			if err := stream.emitTool(builder); err != nil {
+				return err
+			}
+		}
+		if stream.completed {
+			return nil
+		}
+		if err := stream.emitPendingTools(); err != nil {
+			return err
+		}
+		stream.completed = true
+		stream.providerState = providerState
 		stream.usage = mapResponsesUsage(response.Usage)
 		stream.finish, stream.rawFinish = responsesFinish(response)
 		if stream.textStarted {
@@ -404,64 +574,324 @@ func (stream *responsesStream) mapEvent(eventType, delta, name, itemID, callID s
 	return nil
 }
 
+func isResponsesToolLifecycleEvent(eventType string) bool {
+	switch eventType {
+	case "response.output_item.added",
+		"response.function_call_arguments.delta",
+		"response.custom_tool_call_input.delta":
+		return true
+	default:
+		return false
+	}
+}
+
 type responseItem struct {
 	Type      string          `json:"type"`
 	ID        string          `json:"id"`
 	CallID    string          `json:"call_id"`
 	Name      string          `json:"name"`
+	Input     *string         `json:"input"`
 	Arguments json.RawMessage `json:"arguments"`
 }
 
 func isToolItem(kind string) bool { return kind == "function_call" || kind == "custom_tool_call" }
 
-func (stream *responsesStream) tool(itemID, callID string, index *int) *toolBuilder {
-	key := first(callID, itemID)
-	if key == "" && index != nil {
-		key = fmt.Sprintf("index:%d", *index)
+func decodeResponseToolItem(raw json.RawMessage) (responseItem, bool, error) {
+	var envelope struct {
+		Type string `json:"type"`
 	}
-	if builder := stream.tools[key]; builder != nil {
-		return builder
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return responseItem{}, false, fmt.Errorf("invalid Responses output item: %w", err)
 	}
-	builder := &toolBuilder{id: first(callID, itemID)}
-	stream.tools[key] = builder
-	stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: builder.id})
-	return builder
+	if !isToolItem(envelope.Type) {
+		return responseItem{}, false, nil
+	}
+	var item responseItem
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return responseItem{}, false, fmt.Errorf("invalid Responses %s item: %w", envelope.Type, err)
+	}
+	return item, true, nil
 }
 
-func (stream *responsesStream) updateTool(item responseItem, index *int, replace bool) *toolBuilder {
-	builder := stream.tool(item.ID, item.CallID, index)
+func (stream *responsesStream) tool(itemID, callID string, index *int) (*toolBuilder, error) {
+	builder, err := stream.lookupTool(itemID, callID, index)
+	if err != nil {
+		return nil, err
+	}
+	if builder == nil {
+		if err := stream.toolBudget.Begin(); err != nil {
+			return nil, fmt.Errorf("Responses %w", err)
+		}
+		identity := fmt.Sprintf("responses:%d", len(stream.tools))
+		builder = &toolBuilder{id: first(callID, itemID), identity: identity}
+		stream.tools = append(stream.tools, builder)
+		stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: builder.id})
+	}
+	if err := stream.registerToolAliases(builder, itemID, callID, index); err != nil {
+		return nil, err
+	}
+	return builder, nil
+}
+
+func (stream *responsesStream) toolForTerminalEvent(itemID, callID string, index *int) (*toolBuilder, error) {
+	if !stream.completed {
+		return stream.tool(itemID, callID, index)
+	}
+	builder, err := stream.lookupTool(itemID, callID, index)
+	if err != nil {
+		return nil, err
+	}
+	if builder == nil {
+		return nil, errors.New("Responses terminal tool event introduced a call after response.completed")
+	}
+	if !builder.emitted {
+		return nil, errors.New("Responses terminal tool event finalized an uncommitted call after response.completed")
+	}
+	if err := stream.registerToolAliases(builder, itemID, callID, index); err != nil {
+		return nil, err
+	}
+	return builder, nil
+}
+
+func (stream *responsesStream) lookupTool(itemID, callID string, index *int) (*toolBuilder, error) {
+	var found *toolBuilder
+	merge := func(candidate *toolBuilder) error {
+		if candidate == nil {
+			return nil
+		}
+		if found != nil && found != candidate {
+			return errors.New("Responses tool aliases resolve to different calls")
+		}
+		found = candidate
+		return nil
+	}
+	if index != nil {
+		if err := merge(stream.toolsByOutputIndex[*index]); err != nil {
+			return nil, err
+		}
+	}
+	if itemID != "" {
+		if err := merge(stream.toolsByItemID[itemID]); err != nil {
+			return nil, err
+		}
+		if err := merge(stream.toolsByPrefixedCallID[itemID]); err != nil {
+			return nil, err
+		}
+		if err := merge(stream.toolsByCallID[itemID]); err != nil {
+			return nil, err
+		}
+	}
+	if callID != "" {
+		callBuilder := stream.toolsByCallID[callID]
+		if err := merge(callBuilder); err != nil {
+			return nil, err
+		}
+		if callBuilder == nil {
+			if err := merge(stream.toolsByItemID[callID]); err != nil {
+				return nil, err
+			}
+			if err := merge(stream.toolsByPrefixedCallID["fc_"+callID]); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return found, nil
+}
+
+func (stream *responsesStream) registerToolAliases(builder *toolBuilder, itemID, callID string, index *int) error {
+	if callID != "" && builder.callID != "" && builder.callID != callID {
+		return fmt.Errorf("Responses tool call identity %q changed call ID from %q to %q", builder.identity, builder.callID, callID)
+	}
+	if index != nil {
+		if builder.hasOutputIndex && builder.outputIndex != *index {
+			return fmt.Errorf("Responses tool call identity %q changed output index from %d to %d", builder.identity, builder.outputIndex, *index)
+		}
+		if existing := stream.toolsByOutputIndex[*index]; existing != nil && existing != builder {
+			return fmt.Errorf("Responses output index %d is already bound to another tool call", *index)
+		}
+		if stream.toolsByOutputIndex[*index] == nil {
+			if err := stream.toolBudget.AddAlias("output_index"); err != nil {
+				return fmt.Errorf("Responses %w", err)
+			}
+		}
+		stream.toolsByOutputIndex[*index] = builder
+		builder.outputIndex = *index
+		builder.hasOutputIndex = true
+	}
+	if err := stream.bindToolAlias(stream.toolsByItemID, itemID, builder, "item ID"); err != nil {
+		return err
+	}
+	if callID == "" && strings.HasPrefix(itemID, "fc_") {
+		if err := stream.bindToolAlias(stream.toolsByPrefixedCallID, itemID, builder, "prefixed item ID"); err != nil {
+			return err
+		}
+	}
+	if err := stream.bindToolAlias(stream.toolsByCallID, callID, builder, "call ID"); err != nil {
+		return err
+	}
+	if callID != "" && builder.callID == "" {
+		if err := stream.bindToolAlias(stream.toolsByPrefixedCallID, "fc_"+callID, builder, "prefixed call ID"); err != nil {
+			return err
+		}
+		builder.callID = callID
+	}
+	return nil
+}
+
+func (stream *responsesStream) bindToolAlias(index map[string]*toolBuilder, alias string, builder *toolBuilder, kind string) error {
+	if alias == "" {
+		return nil
+	}
+	if existing := index[alias]; existing != nil && existing != builder {
+		return fmt.Errorf("Responses %s %q is already bound to another tool call", kind, alias)
+	}
+	if index[alias] == nil {
+		if err := stream.toolBudget.AddAlias(alias); err != nil {
+			return fmt.Errorf("Responses %w", err)
+		}
+	}
+	index[alias] = builder
+	return nil
+}
+
+func (stream *responsesStream) updateTool(item responseItem, index *int, replace bool) (*toolBuilder, error) {
+	builder, err := stream.tool(item.ID, item.CallID, index)
+	if err != nil {
+		return nil, err
+	}
 	if item.CallID != "" {
 		builder.id = item.CallID
 	} else if builder.id == "" {
 		builder.id = item.ID
 	}
-	if item.Name != "" {
-		builder.name = item.Name
+	if item.Type != "" {
+		if builder.kind != "" && builder.kind != item.Type {
+			return nil, fmt.Errorf("Responses tool call identity %q changed kind from %q to %q", builder.identity, builder.kind, item.Type)
+		}
+		builder.kind = item.Type
 	}
-	if replace && len(item.Arguments) > 0 {
-		if text, err := decodeArguments(item.Arguments); err == nil {
-			builder.arguments.Reset()
-			builder.arguments.WriteString(text)
+	if err := stream.setToolName(builder, item.Name); err != nil {
+		return nil, err
+	}
+	if replace {
+		arguments, present, err := responseItemArguments(item)
+		if err != nil {
+			return nil, err
+		}
+		if !present {
+			if builder.kind == "custom_tool_call" && !builder.argumentsDone {
+				arguments = customToolArguments(builder.arguments.String())
+			} else if builder.arguments.Len() > 0 {
+				arguments = append(json.RawMessage(nil), builder.arguments.String()...)
+			} else {
+				arguments = json.RawMessage(`{}`)
+			}
+		}
+		if err := stream.finalizeToolArguments(builder, item.Name, arguments); err != nil {
+			return nil, err
 		}
 	}
-	return builder
+	return builder, nil
+}
+
+func (stream *responsesStream) setToolName(builder *toolBuilder, name string) error {
+	if name == "" {
+		return nil
+	}
+	if builder.name != "" && builder.name != name {
+		return fmt.Errorf("Responses tool call identity %q changed name from %q to %q", builder.identity, builder.name, name)
+	}
+	if builder.name == "" {
+		if err := stream.toolBudget.AddMetadata(name); err != nil {
+			return fmt.Errorf("Responses %w", err)
+		}
+		builder.name = name
+	}
+	return nil
+}
+
+func (stream *responsesStream) finalizeToolArguments(builder *toolBuilder, name string, arguments json.RawMessage) error {
+	if err := stream.setToolName(builder, name); err != nil {
+		return err
+	}
+	accepted, err := stream.toolArguments.Accept(builder.identity, "<arguments>", arguments)
+	if err != nil {
+		return fmt.Errorf("Responses %w", err)
+	}
+	if !accepted {
+		return nil
+	}
+	builder.arguments.Reset()
+	builder.arguments.Write(arguments)
+	builder.argumentsDone = true
+	return nil
+}
+
+func responseItemArguments(item responseItem) (json.RawMessage, bool, error) {
+	if item.Type == "custom_tool_call" {
+		if item.Input == nil {
+			return nil, false, nil
+		}
+		return customToolArguments(*item.Input), true, nil
+	}
+	if len(item.Arguments) == 0 {
+		return nil, false, nil
+	}
+	text, err := decodeArguments(item.Arguments)
+	if err != nil {
+		return nil, false, err
+	}
+	return json.RawMessage(text), true, nil
+}
+
+func customToolArguments(input string) json.RawMessage {
+	arguments, _ := json.Marshal(map[string]string{"input": input})
+	return arguments
+}
+
+func (stream *responsesStream) emitPendingTools() error {
+	for _, builder := range stream.tools {
+		if builder.emitted || (!builder.argumentsDone && builder.arguments.Len() == 0) {
+			continue
+		}
+		if builder.kind == "custom_tool_call" && !builder.argumentsDone {
+			if err := stream.finalizeToolArguments(builder, builder.name, customToolArguments(builder.arguments.String())); err != nil {
+				return err
+			}
+		}
+		if err := stream.emitTool(builder); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (stream *responsesStream) emitTool(builder *toolBuilder) error {
 	id := builder.id
-	if stream.emitted[id] {
-		return nil
-	}
 	arguments := json.RawMessage(builder.arguments.String())
 	if len(arguments) == 0 {
 		arguments = json.RawMessage(`{}`)
 	}
+	if builder.emitted && builder.emittedID != id {
+		return fmt.Errorf("Responses tool call identity %q changed final ID from %q to %q", builder.identity, builder.emittedID, id)
+	}
 	if !json.Valid(arguments) {
 		return fmt.Errorf("Responses tool call %q has invalid JSON arguments", id)
 	}
-	stream.emitted[id] = true
+	accepted, err := stream.toolCalls.Accept(builder.identity, builder.name, arguments)
+	if err != nil {
+		return fmt.Errorf("Responses %w", err)
+	}
+	if !accepted {
+		return nil
+	}
+	builder.emitted = true
+	builder.emittedID = id
 	call := &llmux.ToolCall{ID: id, Name: builder.name, Arguments: arguments}
-	stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputEnd, ID: id}, llmux.Part{Kind: llmux.PartToolCall, ID: id, ToolCall: call})
+	stream.pending = append(stream.pending,
+		llmux.Part{Kind: llmux.PartToolInputEnd, ID: id},
+		llmux.Part{Kind: llmux.PartToolCall, ID: id, ToolCall: call},
+	)
 	return nil
 }
 

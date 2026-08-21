@@ -33,6 +33,18 @@ result, err := model.Generate(ctx, llmux.Request{
 
 Anthropic Messages (including Anthropic-compatible vendors such as DeepSeek) requires `max_tokens`. Set `CallOptions.MaxOutputTokens` on each request, or set `anthropic.Config.DefaultMaxOutputTokens` / `compat.Config.DefaultMaxOutputTokens` for a provider-level default. When neither is set, the library uses `4096`.
 
+Streaming tool-call finalization is identity-safe across protocols. OpenAI
+Responses correlates `output_index`, `item_id`, `call_id`, and prefixed call-ID
+aliases before emitting one final call. Chat Completions, Anthropic, Bedrock,
+Cohere, and Google treat repeated terminal frames for the same stable identity
+as idempotent, while preserving distinct and ID-less calls. Reusing an identity
+with a conflicting tool name or JSON payload fails the stream.
+Responses keeps progressive input parts, emits at `output_item.done` once a
+canonical `call_id` is known, and defers item-only calls to
+`response.completed` so late aliases cannot execute twice. Per-stream builder,
+identity, alias, metadata, and argument budgets fail closed before untrusted
+provider frames can grow without bound.
+
 ### Codex and InferenceHub
 
 ```go
@@ -94,6 +106,16 @@ result, err := model.Generate(ctx, llmux.Request{
 ```
 
 Anthropic Messages（含 DeepSeek 等 Anthropic 兼容供应商）必须提供 `max_tokens`。请在请求上设置 `CallOptions.MaxOutputTokens`，或在 `anthropic.Config.DefaultMaxOutputTokens` / `compat.Config.DefaultMaxOutputTokens` 配置提供商级默认值。两者都未设置时，库使用 `4096`。
+
+各协议的流式工具调用都按稳定身份进行一次性终结。OpenAI Responses 会先关联
+`output_index`、`item_id`、`call_id` 与带前缀的调用 ID 别名，再只发送一次
+最终调用。Chat Completions、Anthropic、Bedrock、Cohere 与 Google 对同一稳定
+身份的重复终结帧执行幂等处理，同时保留不同调用和无 ID 调用；同一身份若携带
+冲突的工具名或 JSON 参数，流会显式失败。
+Responses 保留渐进式参数事件；已得到规范 `call_id` 时在
+`output_item.done` 发送，只有 item ID 的调用会延迟到
+`response.completed`，避免迟到的别名导致重复执行。每条流都限制 builder、
+身份、别名、元数据与参数占用，超过预算会显式失败，不能无限增长。
 
 ### Codex 与 InferenceHub
 

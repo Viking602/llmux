@@ -10,35 +10,44 @@ import (
 	"sync"
 
 	"github.com/Viking602/llmux"
+	internalstream "github.com/Viking602/llmux/internal/stream"
 )
 
 type blockBuilder struct {
-	kind      string
-	id        string
-	name      string
-	text      strings.Builder
-	signature strings.Builder
-	input     strings.Builder
+	kind          string
+	id            string
+	name          string
+	text          strings.Builder
+	signature     strings.Builder
+	input         strings.Builder
+	suppressInput bool
+	finalized     bool
 }
 
 type converseStream struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	body       io.ReadCloser
-	warnings   []string
-	includeRaw bool
-	blocks     map[int]*blockBuilder
-	pending    []llmux.Part
-	usage      llmux.Usage
-	finish     llmux.FinishReason
-	rawFinish  string
-	stopped    bool
-	terminal   bool
-	closeOnce  sync.Once
+	ctx           context.Context
+	cancel        context.CancelFunc
+	body          io.ReadCloser
+	warnings      []string
+	includeRaw    bool
+	blocks        map[int]*blockBuilder
+	pending       []llmux.Part
+	usage         llmux.Usage
+	finish        llmux.FinishReason
+	rawFinish     string
+	stopped       bool
+	terminal      bool
+	closeOnce     sync.Once
+	toolCalls     internalstream.ToolCallTracker
+	toolBudget    internalstream.ToolCallBudget
+	activeToolIDs map[string]int
 }
 
 func newConverseStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, warnings []string, includeRaw bool) *converseStream {
-	return &converseStream{ctx: ctx, cancel: cancel, body: body, warnings: warnings, includeRaw: includeRaw, blocks: make(map[int]*blockBuilder)}
+	return &converseStream{
+		ctx: ctx, cancel: cancel, body: body, warnings: warnings, includeRaw: includeRaw,
+		blocks: make(map[int]*blockBuilder), activeToolIDs: make(map[string]int),
+	}
 }
 
 func (stream *converseStream) Close() error {
@@ -85,6 +94,9 @@ func (stream *converseStream) Recv() (llmux.Part, error) {
 }
 
 func (stream *converseStream) mapEvent(event eventMessage) error {
+	if stream.stopped && event.EventType != "messageStop" && event.EventType != "metadata" {
+		return fmt.Errorf("Bedrock event %q arrived after messageStop", event.EventType)
+	}
 	switch event.EventType {
 	case "messageStart":
 		stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartResponseMetadata, Response: llmux.ResponseMetadata{}})
@@ -101,10 +113,34 @@ func (stream *converseStream) mapEvent(event eventMessage) error {
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {
 			return err
 		}
+		if stream.blocks[payload.ContentBlockIndex] != nil {
+			return fmt.Errorf("Bedrock content block index %d was started more than once", payload.ContentBlockIndex)
+		}
 		if payload.Start.ToolUse != nil {
+			if err := stream.toolBudget.Begin(); err != nil {
+				return fmt.Errorf("Bedrock %w", err)
+			}
 			builder := &blockBuilder{kind: "toolUse", id: payload.Start.ToolUse.ToolUseID, name: payload.Start.ToolUse.Name}
+			if err := stream.toolBudget.AddAlias(builder.id); err != nil {
+				return fmt.Errorf("Bedrock %w", err)
+			}
+			if err := stream.toolBudget.AddMetadata(builder.name); err != nil {
+				return fmt.Errorf("Bedrock %w", err)
+			}
+			if builder.id != "" {
+				if stream.activeToolIDs == nil {
+					stream.activeToolIDs = make(map[string]int)
+				}
+				if activeIndex, exists := stream.activeToolIDs[builder.id]; exists {
+					return fmt.Errorf("Bedrock tool call ID %q is already active at block %d", builder.id, activeIndex)
+				}
+				stream.activeToolIDs[builder.id] = payload.ContentBlockIndex
+			}
+			builder.suppressInput = stream.toolCalls.Seen(builder.id)
 			stream.blocks[payload.ContentBlockIndex] = builder
-			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: builder.id, ToolName: builder.name})
+			if !builder.suppressInput {
+				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: builder.id, ToolName: builder.name})
+			}
 		}
 	case "contentBlockDelta":
 		var payload struct {
@@ -145,12 +181,19 @@ func (stream *converseStream) mapEvent(event eventMessage) error {
 				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartReasoningDelta, ID: indexID(payload.ContentBlockIndex), Delta: payload.Delta.Reasoning.Text})
 			}
 		}
+		if builder != nil && builder.finalized {
+			return fmt.Errorf("Bedrock delta for finalized block %d", payload.ContentBlockIndex)
+		}
 		if payload.Delta.ToolUse != nil {
 			if builder == nil {
 				return fmt.Errorf("Bedrock tool delta for unknown block %d", payload.ContentBlockIndex)
 			}
-			builder.input.WriteString(payload.Delta.ToolUse.Input)
-			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: builder.id, Delta: payload.Delta.ToolUse.Input})
+			if err := stream.toolBudget.AppendArguments(&builder.input, payload.Delta.ToolUse.Input); err != nil {
+				return fmt.Errorf("Bedrock %w", err)
+			}
+			if !builder.suppressInput {
+				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: builder.id, Delta: payload.Delta.ToolUse.Input})
+			}
 		}
 	case "contentBlockStop":
 		var payload struct {
@@ -161,6 +204,9 @@ func (stream *converseStream) mapEvent(event eventMessage) error {
 		}
 		builder := stream.blocks[payload.ContentBlockIndex]
 		if builder == nil {
+			return nil
+		}
+		if builder.finalized {
 			return nil
 		}
 		switch builder.kind {
@@ -176,9 +222,18 @@ func (stream *converseStream) mapEvent(event eventMessage) error {
 			if !json.Valid(arguments) {
 				return fmt.Errorf("Bedrock tool call %q has invalid input", builder.id)
 			}
+			delete(stream.activeToolIDs, builder.id)
+			accepted, err := stream.toolCalls.Accept(builder.id, builder.name, arguments)
+			if err != nil {
+				return fmt.Errorf("Bedrock %w", err)
+			}
+			if !accepted {
+				break
+			}
 			call := &llmux.ToolCall{ID: builder.id, Name: builder.name, Arguments: arguments}
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputEnd, ID: builder.id}, llmux.Part{Kind: llmux.PartToolCall, ID: builder.id, ToolCall: call})
 		}
+		builder.finalized = true
 	case "messageStop":
 		var payload struct {
 			StopReason string `json:"stopReason"`
@@ -235,16 +290,20 @@ func (stream *converseStream) pop() (llmux.Part, bool) {
 	stream.pending = stream.pending[1:]
 	return part, true
 }
+
 func (stream *converseStream) popOrEOF() (llmux.Part, error) {
 	if part, ok := stream.pop(); ok {
 		return part, nil
 	}
 	return llmux.Part{}, io.EOF
 }
+
 func (stream *converseStream) fail(err error) (llmux.Part, error) {
+	contextErr := stream.ctx.Err()
 	stream.terminal = true
+	stream.pending = nil
 	_ = stream.Close()
-	if contextErr := stream.ctx.Err(); contextErr != nil {
+	if contextErr != nil {
 		return llmux.Part{}, contextErr
 	}
 	var providerError *llmux.ProviderError
