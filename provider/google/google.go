@@ -59,6 +59,14 @@ func New(config Config) (*Provider, error) {
 
 func (provider *Provider) Name() string { return provider.config.ProviderName }
 
+func (provider *Provider) Descriptor() llmux.ProviderDescriptor {
+	return llmux.ProviderDescriptor{
+		Name:           provider.Name(),
+		WireProtocols:  []string{"google-generate-content"},
+		Authentication: []string{"api-key"},
+	}
+}
+
 func (provider *Provider) LanguageModel(modelID string) (llmux.LanguageModel, error) {
 	if strings.TrimSpace(modelID) == "" {
 		return nil, errors.New("google: model ID is empty")
@@ -94,7 +102,7 @@ func (model *model) Generate(ctx context.Context, request llmux.Request) (llmux.
 	if request.Options.IncludeRawChunks {
 		result.Raw = append(json.RawMessage(nil), payload...)
 	}
-	return result, nil
+	return llmux.ConformResult(result)
 }
 
 func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.Stream, error) {
@@ -121,7 +129,7 @@ func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.St
 			return nil, fmt.Errorf("google: expected text/event-stream, got %q", contentType)
 		}
 	}
-	return newGeminiStream(streamCtx, cancel, response.Body, model.provider.Name(), llmux.ResponseMetadata{ModelID: model.id, Headers: selectedHeaders(response.Header)}, warnings, request.Options.IncludeRawChunks), nil
+	return llmux.ConformStream(newGeminiStream(streamCtx, cancel, response.Body, model.provider.Name(), llmux.ResponseMetadata{ModelID: model.id, Headers: selectedHeaders(response.Header)}, warnings, request.Options.IncludeRawChunks)), nil
 }
 
 func (model *model) endpoint(streaming bool) string {
@@ -308,7 +316,7 @@ func googleContent(message llmux.Message) (map[string]any, error) {
 	}
 	for _, part := range message.Content {
 		switch part.Kind {
-		case llmux.ContentText:
+		case llmux.ContentText, llmux.ContentCommentary, llmux.ContentFinalAnswer:
 			parts = append(parts, map[string]any{"text": part.Text})
 		case llmux.ContentReasoning:
 			block := map[string]any{"text": part.Text, "thought": true}
@@ -375,11 +383,11 @@ type wireCandidate struct {
 }
 
 type googleUsage struct {
-	PromptTokenCount        int `json:"promptTokenCount"`
-	CandidatesTokenCount    int `json:"candidatesTokenCount"`
-	TotalTokenCount         int `json:"totalTokenCount"`
-	CachedContentTokenCount int `json:"cachedContentTokenCount"`
-	ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+	PromptTokenCount        int  `json:"promptTokenCount"`
+	CandidatesTokenCount    int  `json:"candidatesTokenCount"`
+	TotalTokenCount         int  `json:"totalTokenCount"`
+	CachedContentTokenCount *int `json:"cachedContentTokenCount"`
+	ThoughtsTokenCount      int  `json:"thoughtsTokenCount"`
 }
 
 func parseResult(payload []byte) (llmux.Result, error) {
@@ -513,7 +521,18 @@ func finishReason(raw string, toolCalls bool) (llmux.FinishReason, string) {
 }
 
 func convertUsage(usage googleUsage) llmux.Usage {
-	return llmux.Usage{InputTokens: usage.PromptTokenCount, CachedInputTokens: usage.CachedContentTokenCount, OutputTokens: usage.CandidatesTokenCount, ReasoningTokens: usage.ThoughtsTokenCount, TotalTokens: usage.TotalTokenCount}
+	cached := 0
+	if usage.CachedContentTokenCount != nil {
+		cached = *usage.CachedContentTokenCount
+	}
+	return llmux.NormalizeUsage(llmux.Usage{
+		InputTokens:               usage.PromptTokenCount,
+		CachedInputTokens:         cached,
+		CachedInputTokensReported: usage.CachedContentTokenCount != nil,
+		OutputTokens:              llmux.SaturatingTokenSum(usage.CandidatesTokenCount, usage.ThoughtsTokenCount),
+		ReasoningTokens:           usage.ThoughtsTokenCount,
+		TotalTokens:               usage.TotalTokenCount,
+	})
 }
 
 func (model *model) responseError(response *http.Response) error {

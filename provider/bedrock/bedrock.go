@@ -69,6 +69,18 @@ func New(config Config) (*Provider, error) {
 
 func (provider *Provider) Name() string { return "amazon-bedrock" }
 
+func (provider *Provider) Descriptor() llmux.ProviderDescriptor {
+	authentication := "aws-sigv4"
+	if provider.config.BearerToken != "" {
+		authentication = "bearer"
+	}
+	return llmux.ProviderDescriptor{
+		Name:           provider.Name(),
+		WireProtocols:  []string{"aws-converse"},
+		Authentication: []string{authentication},
+	}
+}
+
 func (provider *Provider) LanguageModel(modelID string) (llmux.LanguageModel, error) {
 	if strings.TrimSpace(modelID) == "" {
 		return nil, errors.New("bedrock: model ID is empty")
@@ -108,7 +120,7 @@ func (model *model) Generate(ctx context.Context, request llmux.Request) (llmux.
 	if request.Options.IncludeRawChunks {
 		result.Raw = append(json.RawMessage(nil), payload...)
 	}
-	return result, nil
+	return llmux.ConformResult(result)
 }
 
 func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.Stream, error) {
@@ -132,7 +144,7 @@ func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.St
 		cancel()
 		return nil, model.responseError(response)
 	}
-	return newConverseStream(streamCtx, cancel, response.Body, warnings, request.Options.IncludeRawChunks), nil
+	return llmux.ConformStream(newConverseStream(streamCtx, cancel, response.Body, warnings, request.Options.IncludeRawChunks)), nil
 }
 
 func (model *model) endpoint(streaming bool) string {
@@ -302,7 +314,7 @@ func bedrockMessage(message llmux.Message) (map[string]any, error) {
 	}
 	for _, part := range message.Content {
 		switch part.Kind {
-		case llmux.ContentText:
+		case llmux.ContentText, llmux.ContentCommentary, llmux.ContentFinalAnswer:
 			content = append(content, map[string]any{"text": part.Text})
 		case llmux.ContentReasoning:
 			block := map[string]any{"reasoningContent": map[string]any{"reasoningText": map[string]any{"text": part.Text}}}
@@ -343,11 +355,11 @@ func bedrockMessage(message llmux.Message) (map[string]any, error) {
 }
 
 type wireUsage struct {
-	InputTokens           int `json:"inputTokens"`
-	OutputTokens          int `json:"outputTokens"`
-	TotalTokens           int `json:"totalTokens"`
-	CacheReadInputTokens  int `json:"cacheReadInputTokens"`
-	CacheWriteInputTokens int `json:"cacheWriteInputTokens"`
+	InputTokens           int  `json:"inputTokens"`
+	OutputTokens          int  `json:"outputTokens"`
+	TotalTokens           int  `json:"totalTokens"`
+	CacheReadInputTokens  *int `json:"cacheReadInputTokens"`
+	CacheWriteInputTokens *int `json:"cacheWriteInputTokens"`
 }
 
 func parseResult(payload []byte) (llmux.Result, error) {
@@ -430,7 +442,25 @@ func finishReason(raw string) llmux.FinishReason {
 }
 
 func usageResult(usage wireUsage) llmux.Usage {
-	return llmux.Usage{InputTokens: usage.InputTokens, CachedInputTokens: usage.CacheReadInputTokens, CacheWriteInputTokens: usage.CacheWriteInputTokens, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens}
+	cacheRead := bedrockIntValue(usage.CacheReadInputTokens)
+	cacheWrite := bedrockIntValue(usage.CacheWriteInputTokens)
+	input := llmux.SaturatingTokenSum(usage.InputTokens, cacheRead, cacheWrite)
+	return llmux.NormalizeUsage(llmux.Usage{
+		InputTokens:                   input,
+		CachedInputTokens:             cacheRead,
+		CachedInputTokensReported:     usage.CacheReadInputTokens != nil,
+		CacheWriteInputTokens:         cacheWrite,
+		CacheWriteInputTokensReported: usage.CacheWriteInputTokens != nil,
+		OutputTokens:                  usage.OutputTokens,
+		TotalTokens:                   max(usage.TotalTokens, llmux.SaturatingTokenSum(input, usage.OutputTokens)),
+	})
+}
+
+func bedrockIntValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (model *model) responseError(response *http.Response) error {

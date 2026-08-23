@@ -53,6 +53,14 @@ func New(config Config) (*Provider, error) {
 
 func (provider *Provider) Name() string { return "vertex" }
 
+func (provider *Provider) Descriptor() llmux.ProviderDescriptor {
+	return llmux.ProviderDescriptor{
+		Name:           provider.Name(),
+		WireProtocols:  []string{"google-generate-content"},
+		Authentication: []string{"oauth-bearer"},
+	}
+}
+
 func (provider *Provider) LanguageModel(modelID string) (llmux.LanguageModel, error) {
 	if strings.TrimSpace(modelID) == "" {
 		return nil, errors.New("vertex: model ID is empty")

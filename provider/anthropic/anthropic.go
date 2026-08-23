@@ -83,6 +83,14 @@ func New(config Config) (*Provider, error) {
 
 func (provider *Provider) Name() string { return provider.config.ProviderName }
 
+func (provider *Provider) Descriptor() llmux.ProviderDescriptor {
+	return llmux.ProviderDescriptor{
+		Name:           provider.Name(),
+		WireProtocols:  []string{"anthropic-messages"},
+		Authentication: []string{"x-api-key"},
+	}
+}
+
 func (provider *Provider) LanguageModel(modelID string) (llmux.LanguageModel, error) {
 	if strings.TrimSpace(modelID) == "" {
 		return nil, errors.New("anthropic: model ID is empty")
@@ -128,7 +136,7 @@ func (model *model) Generate(ctx context.Context, request llmux.Request) (llmux.
 	if request.Options.IncludeRawChunks {
 		result.Raw = append(json.RawMessage(nil), payload...)
 	}
-	return result, nil
+	return llmux.ConformResult(result)
 }
 
 func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.Stream, error) {
@@ -159,7 +167,7 @@ func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.St
 			return nil, fmt.Errorf("anthropic: expected text/event-stream, got %q", contentType)
 		}
 	}
-	return newMessageStream(streamCtx, cancel, response.Body, model.provider.Name(), llmux.ResponseMetadata{ModelID: model.id, Headers: selectedHeaders(response.Header)}, request.Options.IncludeRawChunks), nil
+	return llmux.ConformStream(newMessageStream(streamCtx, cancel, response.Body, model.provider.Name(), llmux.ResponseMetadata{ModelID: model.id, Headers: selectedHeaders(response.Header)}, request.Options.IncludeRawChunks)), nil
 }
 
 func (model *model) endpoint() string { return model.provider.config.BaseURL + "/v1/messages" }
@@ -260,7 +268,7 @@ func anthropicMessage(message llmux.Message) (map[string]any, error) {
 	}
 	for _, part := range message.Content {
 		switch part.Kind {
-		case llmux.ContentText:
+		case llmux.ContentText, llmux.ContentCommentary, llmux.ContentFinalAnswer:
 			blocks = append(blocks, map[string]any{"type": "text", "text": part.Text})
 		case llmux.ContentReasoning:
 			block := map[string]any{"type": "thinking", "thinking": part.Text}
@@ -375,10 +383,10 @@ type response struct {
 }
 
 type usage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	InputTokens              int  `json:"input_tokens"`
+	OutputTokens             int  `json:"output_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
 	OutputTokensDetails      struct {
 		ThinkingTokens int `json:"thinking_tokens"`
 	} `json:"output_tokens_details"`
@@ -443,7 +451,26 @@ func finishReason(reason string) llmux.FinishReason {
 }
 
 func usageResult(value usage) llmux.Usage {
-	return llmux.Usage{InputTokens: value.InputTokens, CachedInputTokens: value.CacheReadInputTokens, CacheWriteInputTokens: value.CacheCreationInputTokens, OutputTokens: value.OutputTokens, ReasoningTokens: value.OutputTokensDetails.ThinkingTokens, TotalTokens: value.InputTokens + value.OutputTokens}
+	cacheRead := intValue(value.CacheReadInputTokens)
+	cacheWrite := intValue(value.CacheCreationInputTokens)
+	input := llmux.SaturatingTokenSum(value.InputTokens, cacheRead, cacheWrite)
+	return llmux.NormalizeUsage(llmux.Usage{
+		InputTokens:                   input,
+		CachedInputTokens:             cacheRead,
+		CachedInputTokensReported:     value.CacheReadInputTokens != nil,
+		CacheWriteInputTokens:         cacheWrite,
+		CacheWriteInputTokensReported: value.CacheCreationInputTokens != nil,
+		OutputTokens:                  value.OutputTokens,
+		ReasoningTokens:               value.OutputTokensDetails.ThinkingTokens,
+		TotalTokens:                   llmux.SaturatingTokenSum(input, value.OutputTokens),
+	})
+}
+
+func intValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (model *model) responseError(response *http.Response) error {

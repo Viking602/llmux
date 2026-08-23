@@ -78,8 +78,12 @@ func parseGoogleModelPage(payload []byte) ([]llmux.ModelInfo, string, error) {
 	result := make([]llmux.ModelInfo, 0, len(envelope.Models))
 	for _, raw := range envelope.Models {
 		var item struct {
-			Name        string `json:"name"`
-			DisplayName string `json:"displayName"`
+			Name                       string   `json:"name"`
+			DisplayName                string   `json:"displayName"`
+			Description                string   `json:"description"`
+			InputTokenLimit            int      `json:"inputTokenLimit"`
+			OutputTokenLimit           int      `json:"outputTokenLimit"`
+			SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
 		}
 		if err := json.Unmarshal(raw, &item); err != nil {
 			return nil, "", fmt.Errorf("google: invalid model entry: %w", err)
@@ -89,13 +93,59 @@ func parseGoogleModelPage(payload []byte) ([]llmux.ModelInfo, string, error) {
 		if id == "" {
 			continue
 		}
+		capabilities := googleModelCapabilities(
+			item.SupportedGenerationMethods,
+			item.InputTokenLimit,
+			item.OutputTokenLimit,
+		)
 		result = append(result, llmux.ModelInfo{
-			ID:          id,
-			DisplayName: item.DisplayName,
-			Raw:         append(json.RawMessage(nil), raw...),
+			ID:           id,
+			DisplayName:  item.DisplayName,
+			Description:  item.Description,
+			Capabilities: capabilities,
+			Raw:          append(json.RawMessage(nil), raw...),
 		})
 	}
 	return result, envelope.NextPageToken, nil
+}
+
+func googleModelCapabilities(methods []string, inputLimit, outputLimit int) *llmux.ModelCapabilities {
+	if methods == nil && inputLimit == 0 && outputLimit == 0 {
+		return nil
+	}
+	capabilities := &llmux.ModelCapabilities{
+		ContextWindow:   inputLimit,
+		MaxOutputTokens: outputLimit,
+	}
+	if methods == nil {
+		return capabilities
+	}
+	streaming := false
+	for _, method := range methods {
+		switch method {
+		case "generateContent":
+			capabilities.InputModalities = appendModality(capabilities.InputModalities, llmux.ModalityText)
+			capabilities.OutputModalities = appendModality(capabilities.OutputModalities, llmux.ModalityText)
+		case "streamGenerateContent":
+			streaming = true
+			capabilities.InputModalities = appendModality(capabilities.InputModalities, llmux.ModalityText)
+			capabilities.OutputModalities = appendModality(capabilities.OutputModalities, llmux.ModalityText)
+		case "embedContent", "batchEmbedContents":
+			capabilities.InputModalities = appendModality(capabilities.InputModalities, llmux.ModalityText)
+			capabilities.OutputModalities = appendModality(capabilities.OutputModalities, llmux.ModalityEmbedding)
+		}
+	}
+	capabilities.Streaming = &streaming
+	return capabilities
+}
+
+func appendModality(values []llmux.Modality, value llmux.Modality) []llmux.Modality {
+	for _, current := range values {
+		if current == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func (provider *Provider) listResponseError(status int, payload []byte) error {

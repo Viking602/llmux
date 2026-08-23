@@ -16,6 +16,11 @@ func TestProviderMatrix(t *testing.T) {
 			t.Fatalf("duplicate provider: %s", provider.ID)
 		}
 		seen[provider.ID] = true
+		descriptor := provider.Descriptor()
+		if descriptor.Name != provider.ID || len(descriptor.WireProtocols) != 1 ||
+			len(descriptor.Capabilities) != len(provider.Capabilities) {
+			t.Fatalf("portable descriptor drift for %s: %#v", provider.ID, descriptor)
+		}
 	}
 	for _, id := range []string{"openai", "anthropic", "google", "bedrock", "codex", "inferencehub", "tavily", "groq", "deepseek"} {
 		if _, ok := Lookup(id); !ok {

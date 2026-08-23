@@ -52,6 +52,14 @@ func New(config Config) (*Provider, error) {
 
 func (provider *Provider) Name() string { return "cohere" }
 
+func (provider *Provider) Descriptor() llmux.ProviderDescriptor {
+	return llmux.ProviderDescriptor{
+		Name:           provider.Name(),
+		WireProtocols:  []string{"cohere-v2-chat"},
+		Authentication: []string{"bearer"},
+	}
+}
+
 func (provider *Provider) LanguageModel(modelID string) (llmux.LanguageModel, error) {
 	if strings.TrimSpace(modelID) == "" {
 		return nil, errors.New("cohere: model ID is empty")
@@ -85,7 +93,7 @@ func (model *model) Generate(ctx context.Context, request llmux.Request) (llmux.
 	if request.Options.IncludeRawChunks {
 		result.Raw = append(json.RawMessage(nil), payload...)
 	}
-	return result, nil
+	return llmux.ConformResult(result)
 }
 
 func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.Stream, error) {
@@ -112,7 +120,7 @@ func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.St
 			return nil, fmt.Errorf("cohere: expected text/event-stream, got %q", contentType)
 		}
 	}
-	return newChatStream(streamCtx, cancel, response.Body, request.Options.IncludeRawChunks), nil
+	return llmux.ConformStream(newChatStream(streamCtx, cancel, response.Body, request.Options.IncludeRawChunks)), nil
 }
 
 func (model *model) headers(overrides map[string]string) http.Header {
@@ -267,7 +275,7 @@ func cohereMessage(message llmux.Message) ([]any, []any, error) {
 	hasImage := false
 	for _, part := range message.Content {
 		switch part.Kind {
-		case llmux.ContentText:
+		case llmux.ContentText, llmux.ContentCommentary, llmux.ContentFinalAnswer:
 			content = append(content, map[string]any{"type": "text", "text": part.Text})
 		case llmux.ContentImage:
 			hasImage = true
@@ -390,7 +398,11 @@ func finishReason(raw string) llmux.FinishReason {
 }
 
 func convertUsage(tokens tokenPair) llmux.Usage {
-	return llmux.Usage{InputTokens: tokens.InputTokens, OutputTokens: tokens.OutputTokens, TotalTokens: tokens.InputTokens + tokens.OutputTokens}
+	return llmux.NormalizeUsage(llmux.Usage{
+		InputTokens:  tokens.InputTokens,
+		OutputTokens: tokens.OutputTokens,
+		TotalTokens:  llmux.SaturatingTokenSum(tokens.InputTokens, tokens.OutputTokens),
+	})
 }
 
 func (model *model) responseError(response *http.Response) error {

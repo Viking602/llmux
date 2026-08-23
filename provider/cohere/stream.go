@@ -96,6 +96,9 @@ func (stream *chatStream) Recv() (llmux.Part, error) {
 				} `json:"usage"`
 			} `json:"delta"`
 		}
+		if err := internalstream.ValidateJSONComplexity([]byte(data)); err != nil {
+			return stream.fail(err)
+		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			return stream.fail(err)
 		}

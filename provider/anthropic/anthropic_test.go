@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Viking602/llmux"
+	internalstream "github.com/Viking602/llmux/internal/stream"
 )
 
 func TestGenerateAndStream(t *testing.T) {
@@ -178,5 +179,32 @@ func TestContentBlockIndexCannotBeRebound(t *testing.T) {
 	}
 	if err := stream.mapEvent("content_block_start", 0, nil, start, nil, usage{}); err == nil {
 		t.Fatal("Anthropic content block index was rebound")
+	}
+}
+
+func TestUsageResultMakesCacheCountersInclusiveAndReported(t *testing.T) {
+	cacheRead, cacheWrite := 2, 3
+	got := usageResult(usage{
+		InputTokens:              5,
+		OutputTokens:             4,
+		CacheReadInputTokens:     &cacheRead,
+		CacheCreationInputTokens: &cacheWrite,
+	})
+	if got.InputTokens != 10 || got.TotalTokens != 14 ||
+		!got.CachedInputTokensReported || !got.CacheWriteInputTokensReported {
+		t.Fatalf("usage = %#v", got)
+	}
+}
+
+func TestSignatureOnlyDeltasAreBoundedBeforePublicParts(t *testing.T) {
+	stream := &messageStream{blocks: map[int]*blockBuilder{0: {kind: "thinking"}}}
+	delta := json.RawMessage(`{"type":"signature_delta","signature":""}`)
+	for index := 0; index < internalstream.MaxRetainedStateItems; index++ {
+		if err := stream.mapEvent("content_block_delta", 0, nil, nil, delta, usage{}); err != nil {
+			t.Fatalf("delta %d failed early: %v", index, err)
+		}
+	}
+	if err := stream.mapEvent("content_block_delta", 0, nil, nil, delta, usage{}); err == nil {
+		t.Fatal("signature-only retained state exceeded its item budget")
 	}
 }

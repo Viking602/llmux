@@ -41,6 +41,7 @@ type messageStream struct {
 	closeOnce     sync.Once
 	toolCalls     internalstream.ToolCallTracker
 	toolBudget    internalstream.ToolCallBudget
+	stateBudget   internalstream.StateBudget
 	activeToolIDs map[string]int
 }
 
@@ -91,6 +92,9 @@ func (stream *messageStream) Recv() (llmux.Part, error) {
 				Type    string `json:"type"`
 				Message string `json:"message"`
 			} `json:"error"`
+		}
+		if err := internalstream.ValidateJSONComplexity([]byte(data)); err != nil {
+			return stream.fail(err)
 		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			return stream.fail(fmt.Errorf("invalid Anthropic stream JSON: %w", err))
@@ -143,6 +147,14 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 		}
 		if stream.blocks[index] != nil {
 			return fmt.Errorf("Anthropic content block index %d was started more than once", index)
+		}
+		switch block.Type {
+		case "text", "thinking", "tool_use", "server_tool_use", "redacted_thinking":
+		default:
+			return fmt.Errorf("Anthropic content block type %q is unsupported", block.Type)
+		}
+		if err := stream.stateBudget.Retain(len(blockRaw)); err != nil {
+			return fmt.Errorf("Anthropic %w", err)
 		}
 		builder := &blockBuilder{kind: block.Type, id: block.ID, name: block.Name}
 		stream.blocks[index] = builder
@@ -216,6 +228,9 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 			builder.text.WriteString(delta.Thinking)
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartReasoningDelta, ID: fmt.Sprint(index), Delta: delta.Thinking})
 		case "signature_delta":
+			if err := stream.stateBudget.Retain(len(delta.Signature)); err != nil {
+				return fmt.Errorf("Anthropic %w", err)
+			}
 			builder.signature.WriteString(delta.Signature)
 		case "input_json_delta":
 			if err := stream.toolBudget.AppendArguments(&builder.input, delta.PartialJSON); err != nil {
@@ -224,6 +239,8 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 			if !builder.suppressInput {
 				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputDelta, ID: builder.id, Delta: delta.PartialJSON})
 			}
+		default:
+			return fmt.Errorf("Anthropic content delta type %q is unsupported", delta.Type)
 		}
 	case "content_block_stop":
 		builder := stream.blocks[index]
@@ -272,7 +289,7 @@ func (stream *messageStream) mapEvent(eventType string, index int, messageRaw, b
 		if eventUsage.OutputTokens > 0 {
 			stream.usage.OutputTokens = eventUsage.OutputTokens
 			stream.usage.ReasoningTokens = eventUsage.OutputTokensDetails.ThinkingTokens
-			stream.usage.TotalTokens = stream.usage.InputTokens + stream.usage.OutputTokens
+			stream.usage = llmux.NormalizeUsage(stream.usage)
 		}
 	case "message_stop":
 		if stream.finish == "" {

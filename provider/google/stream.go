@@ -35,7 +35,10 @@ type geminiStream struct {
 	terminal           bool
 	closeOnce          sync.Once
 	toolCalls          internalstream.ToolCallTracker
+	stateBudget        internalstream.StateBudget
 }
+
+const maxGoogleFanoutParts = 4096
 
 func newGeminiStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, provider string, metadata llmux.ResponseMetadata, warnings []string, includeRaw bool) *geminiStream {
 	return &geminiStream{ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0), provider: provider, metadata: metadata, warnings: warnings, includeRaw: includeRaw}
@@ -76,8 +79,18 @@ func (stream *geminiStream) Recv() (llmux.Part, error) {
 			continue
 		}
 		var chunk wireResponse
+		if err := internalstream.ValidateJSONComplexity([]byte(data)); err != nil {
+			return stream.fail(err)
+		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return stream.fail(err)
+		}
+		fanout := len(chunk.Candidates)
+		for _, candidate := range chunk.Candidates {
+			fanout += len(candidate.Content.Parts)
+		}
+		if fanout > maxGoogleFanoutParts {
+			return stream.fail(fmt.Errorf("Google stream frame expands to %d parts", fanout))
 		}
 		if stream.includeRaw {
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartRaw, Raw: []byte(data)})
@@ -98,6 +111,9 @@ func (stream *geminiStream) Recv() (llmux.Part, error) {
 		if len(chunk.Candidates) > 0 {
 			candidate := chunk.Candidates[0]
 			for _, raw := range candidate.Content.Parts {
+				if err := stream.stateBudget.Retain(len(raw)); err != nil {
+					return stream.fail(fmt.Errorf("Google %w", err))
+				}
 				if len(raw) > internalstream.MaxTrackedToolCallBytes-stream.providerStateBytes {
 					return stream.fail(fmt.Errorf("Google provider state exceeds %d bytes", internalstream.MaxTrackedToolCallBytes))
 				}
@@ -143,13 +159,32 @@ func (stream *geminiStream) Recv() (llmux.Part, error) {
 					if !json.Valid(arguments) {
 						return stream.fail(errors.New("Google streamed invalid function arguments"))
 					}
-					accepted, err := stream.toolCalls.Accept(part.FunctionCall.ID, part.FunctionCall.Name, arguments)
+					callID := part.FunctionCall.ID
+					if strings.TrimSpace(callID) == "" {
+						for {
+							generated, err := llmux.NewGeneratedToolCallID("google")
+							if err != nil {
+								return stream.fail(fmt.Errorf("Google generated tool call id: %w", err))
+							}
+							if !stream.toolCalls.Seen(generated) {
+								callID = generated
+								break
+							}
+						}
+					}
+					accepted, err := stream.toolCalls.Accept(callID, part.FunctionCall.Name, arguments)
 					if err != nil {
 						return stream.fail(fmt.Errorf("Google %w", err))
 					}
 					if accepted {
-						call := &llmux.ToolCall{ID: part.FunctionCall.ID, Name: part.FunctionCall.Name, Arguments: arguments}
-						stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartToolInputStart, ID: call.ID, ToolName: call.Name}, llmux.Part{Kind: llmux.PartToolInputDelta, ID: call.ID, Delta: string(arguments)}, llmux.Part{Kind: llmux.PartToolInputEnd, ID: call.ID}, llmux.Part{Kind: llmux.PartToolCall, ID: call.ID, ToolCall: call})
+						call := &llmux.ToolCall{ID: callID, Name: part.FunctionCall.Name, Arguments: arguments}
+						stream.pending = append(
+							stream.pending,
+							llmux.Part{Kind: llmux.PartToolInputStart, ID: call.ID, ToolName: call.Name},
+							llmux.Part{Kind: llmux.PartToolInputDelta, ID: call.ID, Delta: string(arguments)},
+							llmux.Part{Kind: llmux.PartToolInputEnd, ID: call.ID},
+							llmux.Part{Kind: llmux.PartToolCall, ID: call.ID, ToolCall: call},
+						)
 					}
 				}
 				if part.InlineData != nil {

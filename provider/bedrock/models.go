@@ -96,9 +96,12 @@ func parseBedrockModelList(payload []byte) ([]llmux.ModelInfo, error) {
 	result := make([]llmux.ModelInfo, 0, len(envelope.ModelSummaries))
 	for _, raw := range envelope.ModelSummaries {
 		var item struct {
-			ModelID   string `json:"modelId"`
-			ModelName string `json:"modelName"`
-			Provider  string `json:"providerName"`
+			ModelID                    string   `json:"modelId"`
+			ModelName                  string   `json:"modelName"`
+			Provider                   string   `json:"providerName"`
+			InputModalities            []string `json:"inputModalities"`
+			OutputModalities           []string `json:"outputModalities"`
+			ResponseStreamingSupported *bool    `json:"responseStreamingSupported"`
 		}
 		if err := json.Unmarshal(raw, &item); err != nil {
 			return nil, fmt.Errorf("bedrock: invalid model entry: %w", err)
@@ -106,14 +109,46 @@ func parseBedrockModelList(payload []byte) ([]llmux.ModelInfo, error) {
 		if strings.TrimSpace(item.ModelID) == "" {
 			continue
 		}
+		var capabilities *llmux.ModelCapabilities
+		if item.InputModalities != nil || item.OutputModalities != nil || item.ResponseStreamingSupported != nil {
+			capabilities = &llmux.ModelCapabilities{
+				InputModalities:  bedrockModalities(item.InputModalities),
+				OutputModalities: bedrockModalities(item.OutputModalities),
+				Streaming:        item.ResponseStreamingSupported,
+			}
+		}
 		result = append(result, llmux.ModelInfo{
-			ID:          item.ModelID,
-			DisplayName: item.ModelName,
-			OwnedBy:     item.Provider,
-			Raw:         append(json.RawMessage(nil), raw...),
+			ID:           item.ModelID,
+			DisplayName:  item.ModelName,
+			OwnedBy:      item.Provider,
+			Capabilities: capabilities,
+			Raw:          append(json.RawMessage(nil), raw...),
 		})
 	}
 	return result, nil
+}
+
+func bedrockModalities(values []string) []llmux.Modality {
+	result := make([]llmux.Modality, 0, len(values))
+	for _, value := range values {
+		switch strings.ToUpper(strings.TrimSpace(value)) {
+		case "TEXT":
+			result = append(result, llmux.ModalityText)
+		case "IMAGE":
+			result = append(result, llmux.ModalityImage)
+		case "AUDIO":
+			result = append(result, llmux.ModalityAudio)
+		case "VIDEO":
+			result = append(result, llmux.ModalityVideo)
+		case "DOCUMENT", "FILE":
+			result = append(result, llmux.ModalityFile)
+		case "EMBEDDING", "EMBEDDINGS":
+			result = append(result, llmux.ModalityEmbedding)
+		case "RERANKING", "RERANK":
+			result = append(result, llmux.ModalityReranking)
+		}
+	}
+	return result
 }
 
 func (provider *Provider) listResponseError(status int, payload []byte) error {

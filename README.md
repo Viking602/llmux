@@ -10,8 +10,12 @@ Implemented:
 
 - Native adapters for OpenAI, OpenAI Codex, Anthropic, Google, Vertex AI, Amazon Bedrock, Azure OpenAI, Cohere, Mistral, xAI, DeepSeek, OpenResponses, Voyage AI, and Tavily
 - A generic provider registry, including InferenceHub, that prefers the Responses API when available, then Anthropic Messages, and finally Chat Completions
-- Text generation, reasoning, tool calling, embeddings, reranking, speech, transcription, image, video, file, and search interfaces
-- Bounded SSE parsing, connection reuse, exponential backoff, `Retry-After`, and context cancellation
+- Text generation, phased commentary/final answers, reasoning, tool calling,
+  embeddings, reranking, speech, transcription, image, video, file, and search
+  interfaces with optional provider factories
+- Strict terminal stream validation, aggregate stream bounds, bounded SSE
+  parsing, connection reuse, exponential backoff, `Retry-After`, and context
+  cancellation
 
 ### Quick start
 
@@ -44,6 +48,13 @@ canonical `call_id` is known, and defers item-only calls to
 `response.completed` so late aliases cannot execute twice. Per-stream builder,
 identity, alias, metadata, and argument budgets fail closed before untrusted
 provider frames can grow without bound.
+
+Usage follows one portable convention across protocols: input includes reported
+cache reads/writes, output includes reasoning, totals are inclusive, and
+explicit zero cache counters remain distinguishable from unsupported telemetry.
+`ModelInfo.Capabilities`, `DescribeProvider`, and the optional modality factory
+interfaces expose capability metadata without adding methods to the base
+`Provider` contract.
 
 ### Codex and InferenceHub
 
@@ -84,8 +95,10 @@ Thanks to the [AIMux](https://github.com/arcships/aimux) project for its provide
 
 - OpenAI、OpenAI Codex、Anthropic、Google、Vertex AI、Amazon Bedrock、Azure OpenAI、Cohere、Mistral、xAI、DeepSeek、OpenResponses、Voyage AI 与 Tavily 原生适配
 - 通用供应商注册表（包含 InferenceHub）：优先使用供应商提供的 Responses API，其次使用 Anthropic Messages，最后回退到 Chat Completions
-- 文本生成、推理、工具调用、向量嵌入、重排序、语音、转录、图片、视频、文件与搜索接口
-- 有界 SSE 解析、连接复用、指数退避、`Retry-After` 与上下文取消
+- 文本生成、分阶段 commentary/final answer、推理、工具调用、向量嵌入、重排序、
+  语音、转录、图片、视频、文件与搜索接口，以及可选的供应商模型工厂
+- 严格的流终态校验、整流聚合上限、有界 SSE 解析、连接复用、指数退避、
+  `Retry-After` 与上下文取消
 
 ### 快速开始
 
@@ -116,6 +129,11 @@ Responses 保留渐进式参数事件；已得到规范 `call_id` 时在
 `output_item.done` 发送，只有 item ID 的调用会延迟到
 `response.completed`，避免迟到的别名导致重复执行。每条流都限制 builder、
 身份、别名、元数据与参数占用，超过预算会显式失败，不能无限增长。
+
+各协议使用同一套可移植 usage 语义：输入包含已报告的缓存读写，输出包含推理，
+总量为完整合计；供应商明确报告的零缓存仍与“不支持/未报告”区分。
+`ModelInfo.Capabilities`、`DescribeProvider` 与可选模态工厂接口在不扩张基础
+`Provider` 接口的前提下公开能力元数据。
 
 ### Codex 与 InferenceHub
 

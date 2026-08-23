@@ -87,6 +87,8 @@ type chatStream struct {
 	activeToolIDs    map[string]int
 }
 
+const maxChatFanoutParts = 4096
+
 func newChatStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, provider string, metadata llmux.ResponseMetadata, includeRaw bool, profile CompatProfile, warnings []string) *chatStream {
 	return &chatStream{streamBase: streamBase{ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0), provider: provider, metadata: metadata, includeRaw: includeRaw, warnings: warnings}, tools: make(map[int]*toolBuilder), profile: profile}
 }
@@ -143,8 +145,18 @@ func (stream *chatStream) Recv() (llmux.Part, error) {
 			Code      string          `json:"code"`
 			Error     json.RawMessage `json:"error"`
 		}
+		if err := internalstream.ValidateJSONComplexity([]byte(data)); err != nil {
+			return stream.fail(err)
+		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			return stream.fail(fmt.Errorf("invalid chat stream JSON: %w", err))
+		}
+		fanout := len(chunk.Citations) + len(chunk.Choices)
+		for _, choice := range chunk.Choices {
+			fanout += len(choice.Delta.ToolCalls)
+		}
+		if fanout > maxChatFanoutParts {
+			return stream.fail(fmt.Errorf("chat stream frame expands to %d parts", fanout))
 		}
 		if stream.includeRaw {
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartRaw, Raw: []byte(data)})
@@ -292,6 +304,7 @@ func (stream *chatStream) finishParts() {
 	if stream.finish == "" {
 		stream.finish = llmux.FinishUnknown
 	}
+	stream.usage = normalizeProfileUsage(stream.usage, stream.profile)
 	stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartFinish, FinishReason: stream.finish, RawFinishReason: stream.rawFinish, Usage: stream.usage, Warnings: stream.warnings})
 }
 
@@ -311,23 +324,28 @@ type responsesStream struct {
 	toolsByPrefixedCallID map[string]*toolBuilder
 	toolArguments         internalstream.ToolCallTracker
 	toolCalls             internalstream.ToolCallTracker
+	profile               CompatProfile
 	toolBudget            internalstream.ToolCallBudget
 	usage                 llmux.Usage
 	completed             bool
 	providerState         json.RawMessage
 	finish                llmux.FinishReason
 	rawFinish             string
-	textStarted           bool
+	textStarted           map[int]bool
+	textPhases            map[int]llmux.TextPhase
 	reasoningStarted      bool
 }
 
-func newResponsesStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, provider string, metadata llmux.ResponseMetadata, includeRaw bool, warnings []string) *responsesStream {
+func newResponsesStream(ctx context.Context, cancel context.CancelFunc, body io.ReadCloser, provider string, metadata llmux.ResponseMetadata, includeRaw bool, profile CompatProfile, warnings []string) *responsesStream {
 	return &responsesStream{
 		streamBase:            streamBase{ctx: ctx, cancel: cancel, body: body, reader: internalstream.NewSSEReader(body, 0), provider: provider, metadata: metadata, includeRaw: includeRaw, warnings: warnings},
 		toolsByOutputIndex:    make(map[int]*toolBuilder),
 		toolsByItemID:         make(map[string]*toolBuilder),
+		profile:               profile,
 		toolsByCallID:         make(map[string]*toolBuilder),
 		toolsByPrefixedCallID: make(map[string]*toolBuilder),
+		textStarted:           make(map[int]bool),
+		textPhases:            make(map[int]llmux.TextPhase),
 	}
 }
 
@@ -366,6 +384,7 @@ func (stream *responsesStream) Recv() (llmux.Part, error) {
 		var event struct {
 			Type        string          `json:"type"`
 			Delta       string          `json:"delta"`
+			Phase       llmux.TextPhase `json:"phase"`
 			Text        string          `json:"text"`
 			Name        string          `json:"name"`
 			Input       string          `json:"input"`
@@ -379,6 +398,9 @@ func (stream *responsesStream) Recv() (llmux.Part, error) {
 			Code        string          `json:"code"`
 			Message     string          `json:"message"`
 		}
+		if err := internalstream.ValidateJSONComplexity([]byte(data)); err != nil {
+			return stream.fail(err)
+		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			return stream.fail(fmt.Errorf("invalid Responses stream JSON: %w", err))
 		}
@@ -388,7 +410,7 @@ func (stream *responsesStream) Recv() (llmux.Part, error) {
 		if stream.includeRaw {
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartRaw, Raw: []byte(data)})
 		}
-		if err := stream.mapEvent(event.Type, event.Delta, event.Name, event.Input, event.ItemID, event.CallID, event.OutputIndex, event.Arguments, event.Item, event.Response, []byte(data)); err != nil {
+		if err := stream.mapEvent(event.Type, event.Delta, event.Phase, event.Name, event.Input, event.ItemID, event.CallID, event.OutputIndex, event.Arguments, event.Item, event.Response, []byte(data)); err != nil {
 			return stream.fail(err)
 		}
 		if part, ok := stream.pop(); ok {
@@ -397,7 +419,7 @@ func (stream *responsesStream) Recv() (llmux.Part, error) {
 	}
 }
 
-func (stream *responsesStream) mapEvent(eventType, delta, name, input, itemID, callID string, outputIndex *int, arguments, itemRaw, responseRaw, raw []byte) error {
+func (stream *responsesStream) mapEvent(eventType, delta string, phase llmux.TextPhase, name, input, itemID, callID string, outputIndex *int, arguments, itemRaw, responseRaw, raw []byte) error {
 	if stream.completed && eventType != "response.completed" && isResponsesToolLifecycleEvent(eventType) {
 		return fmt.Errorf("Responses tool event %q arrived after response.completed", eventType)
 	}
@@ -415,12 +437,18 @@ func (stream *responsesStream) mapEvent(eventType, delta, name, input, itemID, c
 			}
 		}
 	case "response.output_text.delta":
-		if !stream.textStarted {
-			stream.textStarted = true
-			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartTextStart, ID: "text-0"})
+		index := valueOrZero(outputIndex)
+		if normalized := normalizeTextPhase(phase); normalized != "" {
+			stream.textPhases[index] = normalized
+		}
+		textPhase := stream.textPhases[index]
+		id := fmt.Sprintf("text-%d", index)
+		if !stream.textStarted[index] {
+			stream.textStarted[index] = true
+			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartTextStart, ID: id, TextPhase: textPhase})
 		}
 		if delta != "" {
-			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartTextDelta, ID: "text-0", Delta: delta})
+			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartTextDelta, ID: id, Delta: delta, TextPhase: textPhase})
 		}
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		if !stream.reasoningStarted {
@@ -438,6 +466,14 @@ func (stream *responsesStream) mapEvent(eventType, delta, name, input, itemID, c
 		if toolItem {
 			_, err = stream.updateTool(item, outputIndex, false)
 			return err
+		}
+		var textItem struct {
+			Phase llmux.TextPhase `json:"phase"`
+		}
+		if json.Unmarshal(itemRaw, &textItem) == nil && outputIndex != nil {
+			if normalized := normalizeTextPhase(textItem.Phase); normalized != "" {
+				stream.textPhases[*outputIndex] = normalized
+			}
 		}
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		builder, err := stream.tool(itemID, callID, outputIndex)
@@ -559,10 +595,17 @@ func (stream *responsesStream) mapEvent(eventType, delta, name, input, itemID, c
 		}
 		stream.completed = true
 		stream.providerState = providerState
-		stream.usage = mapResponsesUsage(response.Usage)
+		stream.usage = normalizeProfileUsage(mapResponsesUsage(response.Usage), stream.profile)
 		stream.finish, stream.rawFinish = responsesFinish(response)
-		if stream.textStarted {
-			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartTextEnd, ID: "text-0"})
+		textIndexes := make([]int, 0, len(stream.textStarted))
+		for index := range stream.textStarted {
+			textIndexes = append(textIndexes, index)
+		}
+		sort.Ints(textIndexes)
+		for _, index := range textIndexes {
+			stream.pending = append(stream.pending, llmux.Part{
+				Kind: llmux.PartTextEnd, ID: fmt.Sprintf("text-%d", index), TextPhase: stream.textPhases[index],
+			})
 		}
 		if stream.reasoningStarted {
 			stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartReasoningEnd, ID: "reasoning-0"})
@@ -937,4 +980,20 @@ func responsesStreamError(raw []byte) error {
 		return &llmux.ProviderError{Kind: llmux.ErrorStream, Code: first(failure.Code, failure.Type), Message: failure.Message}
 	}
 	return &llmux.ProviderError{Kind: llmux.ErrorStream, Code: envelope.Code, Message: first(envelope.Message, "Responses stream failed")}
+}
+
+func valueOrZero(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func normalizeTextPhase(phase llmux.TextPhase) llmux.TextPhase {
+	switch phase {
+	case llmux.TextPhaseCommentary, llmux.TextPhaseFinalAnswer:
+		return phase
+	default:
+		return llmux.TextPhaseUnspecified
+	}
 }

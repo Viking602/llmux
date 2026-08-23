@@ -147,6 +147,37 @@ func TestResponsesStreamAcceptsEOFAfterCompleted(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamPreservesCommentaryAndFinalPhases(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(response, "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"commentary\"}}\n\n")
+		_, _ = fmt.Fprint(response, "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"checking\"}\n\n")
+		_, _ = fmt.Fprint(response, "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"phase\":\"final_answer\"}}\n\n")
+		_, _ = fmt.Fprint(response, "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"done\"}\n\n")
+		_, _ = fmt.Fprint(response, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\",\"output\":[],\"usage\":{}}}\n\n")
+	}))
+	defer server.Close()
+
+	provider, err := New(Config{APIKey: "test-key", Endpoint: server.URL, Client: server.Client(), WireAPI: Responses})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, _ := provider.LanguageModel("gpt-test")
+	stream, err := model.Stream(context.Background(), llmux.Request{Messages: []llmux.Message{llmux.TextMessage(llmux.RoleUser, "go")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := llmux.Collect(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "checkingdone" || len(result.Content) != 2 ||
+		result.Content[0].Kind != llmux.ContentCommentary ||
+		result.Content[1].Kind != llmux.ContentFinalAnswer {
+		t.Fatalf("phased result = %#v", result)
+	}
+}
+
 func TestResponsesUsagePreservesReportedZero(t *testing.T) {
 	result, err := parseResponsesResult([]byte(`{"status":"completed","output":[],"usage":{"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}}`))
 	if err != nil {
@@ -368,14 +399,14 @@ func TestResponsesCustomToolDeltaFallbackWrapsInput(t *testing.T) {
 	stream := newTestResponsesStream()
 	index := 0
 	added := json.RawMessage(`{"type":"custom_tool_call","id":"ctc_tmp","name":"apply_patch"}`)
-	if err := stream.mapEvent("response.output_item.added", "", "", "", "", "", &index, nil, added, nil, added); err != nil {
+	if err := stream.mapEvent("response.output_item.added", "", "", "", "", "", "", &index, nil, added, nil, added); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.mapEvent("response.custom_tool_call_input.delta", "PATCH", "apply_patch", "", "ctc_tmp", "", &index, nil, nil, nil, nil); err != nil {
+	if err := stream.mapEvent("response.custom_tool_call_input.delta", "PATCH", "", "apply_patch", "", "ctc_tmp", "", &index, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	done := json.RawMessage(`{"type":"custom_tool_call","id":"ctc_tmp","call_id":"call-custom","name":"apply_patch"}`)
-	if err := stream.mapEvent("response.output_item.done", "", "", "", "", "", &index, nil, done, nil, done); err != nil {
+	if err := stream.mapEvent("response.output_item.done", "", "", "", "", "", "", &index, nil, done, nil, done); err != nil {
 		t.Fatal(err)
 	}
 	for _, part := range stream.pending {
@@ -393,7 +424,7 @@ func TestResponsesDefersItemOnlyCallUntilCompleted(t *testing.T) {
 	stream := newTestResponsesStream()
 	index := 0
 	itemDone := json.RawMessage(`{"type":"function_call","id":"item-only","name":"lookup","arguments":"{}"}`)
-	if err := stream.mapEvent("response.output_item.done", "", "", "", "", "", &index, nil, itemDone, nil, itemDone); err != nil {
+	if err := stream.mapEvent("response.output_item.done", "", "", "", "", "", "", &index, nil, itemDone, nil, itemDone); err != nil {
 		t.Fatal(err)
 	}
 	for _, part := range stream.pending {
@@ -402,7 +433,7 @@ func TestResponsesDefersItemOnlyCallUntilCompleted(t *testing.T) {
 		}
 	}
 	completed := json.RawMessage(`{"status":"completed","output":[{"type":"function_call","id":"item-only","call_id":"call-final","name":"lookup","arguments":"{}"}]}`)
-	if err := stream.mapEvent("response.completed", "", "", "", "", "", nil, nil, nil, completed, completed); err != nil {
+	if err := stream.mapEvent("response.completed", "", "", "", "", "", "", nil, nil, nil, completed, completed); err != nil {
 		t.Fatal(err)
 	}
 	count := 0
@@ -438,7 +469,7 @@ func TestResponsesRejectsConflictingAndMalformedTerminalCalls(t *testing.T) {
 		json.RawMessage(`{"status":"completed","output":[{"type":"function_call","id":123,"call_id":"call-2","name":"lookup","arguments":"{}"}]}`),
 	} {
 		candidate := newTestResponsesStream()
-		if err := candidate.mapEvent("response.completed", "", "", "", "", "", nil, nil, nil, response, response); err == nil {
+		if err := candidate.mapEvent("response.completed", "", "", "", "", "", "", nil, nil, nil, response, response); err == nil {
 			t.Fatalf("malformed completed response was accepted: %s", response)
 		}
 	}
@@ -447,19 +478,19 @@ func TestResponsesRejectsConflictingAndMalformedTerminalCalls(t *testing.T) {
 func TestResponsesRejectsToolMutationAfterCompletion(t *testing.T) {
 	stream := newTestResponsesStream()
 	first := json.RawMessage(`{"status":"completed","output":[{"type":"function_call","id":"item-1","call_id":"call-1","name":"lookup","arguments":"{}"}]}`)
-	if err := stream.mapEvent("response.completed", "", "", "", "", "", nil, nil, nil, first, first); err != nil {
+	if err := stream.mapEvent("response.completed", "", "", "", "", "", "", nil, nil, nil, first, first); err != nil {
 		t.Fatal(err)
 	}
 	changed := json.RawMessage(`{"status":"completed","output":[{"type":"function_call","id":"item-1","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"function_call","id":"item-2","call_id":"call-2","name":"lookup","arguments":"{}"}]}`)
-	if err := stream.mapEvent("response.completed", "", "", "", "", "", nil, nil, nil, changed, changed); err == nil {
+	if err := stream.mapEvent("response.completed", "", "", "", "", "", "", nil, nil, nil, changed, changed); err == nil {
 		t.Fatal("repeated response.completed introduced a new tool call")
 	}
 	item := json.RawMessage(`{"type":"function_call","id":"item-2","call_id":"call-2","name":"lookup","arguments":"{}"}`)
-	if err := stream.mapEvent("response.output_item.done", "", "", "", "", "", nil, nil, item, nil, item); err == nil {
+	if err := stream.mapEvent("response.output_item.done", "", "", "", "", "", "", nil, nil, item, nil, item); err == nil {
 		t.Fatal("tool event after response.completed was accepted")
 	}
 	arguments := json.RawMessage(`"{\"x\":1}"`)
-	if err := stream.mapEvent("response.function_call_arguments.done", "", "lookup", "", "item-3", "call-3", nil, arguments, nil, nil, nil); err == nil {
+	if err := stream.mapEvent("response.function_call_arguments.done", "", "", "lookup", "", "item-3", "call-3", nil, arguments, nil, nil, nil); err == nil {
 		t.Fatal("arguments.done introduced a tool call after response.completed")
 	}
 }
@@ -468,19 +499,19 @@ func TestResponsesRejectsUncommittedBuilderAfterCompletion(t *testing.T) {
 	stream := newTestResponsesStream()
 	index := 0
 	added := json.RawMessage(`{"type":"function_call","id":"item-late","name":"lookup"}`)
-	if err := stream.mapEvent("response.output_item.added", "", "", "", "", "", &index, nil, added, nil, added); err != nil {
+	if err := stream.mapEvent("response.output_item.added", "", "", "", "", "", "", &index, nil, added, nil, added); err != nil {
 		t.Fatal(err)
 	}
 	completed := json.RawMessage(`{"status":"completed","output":[]}`)
-	if err := stream.mapEvent("response.completed", "", "", "", "", "", nil, nil, nil, completed, completed); err != nil {
+	if err := stream.mapEvent("response.completed", "", "", "", "", "", "", nil, nil, nil, completed, completed); err != nil {
 		t.Fatal(err)
 	}
 	done := json.RawMessage(`{"type":"function_call","id":"item-late","call_id":"call-late","name":"lookup","arguments":"{}"}`)
 	repeated := json.RawMessage(`{"status":"completed","output":[{"type":"function_call","id":"item-late","call_id":"call-late","name":"lookup","arguments":"{}"}]}`)
-	if err := stream.mapEvent("response.completed", "", "", "", "", "", nil, nil, nil, repeated, repeated); err == nil {
+	if err := stream.mapEvent("response.completed", "", "", "", "", "", "", nil, nil, nil, repeated, repeated); err == nil {
 		t.Fatal("repeated response.completed finalized an uncommitted builder")
 	}
-	if err := stream.mapEvent("response.output_item.done", "", "", "", "", "", &index, nil, done, nil, done); err == nil {
+	if err := stream.mapEvent("response.output_item.done", "", "", "", "", "", "", &index, nil, done, nil, done); err == nil {
 		t.Fatal("uncommitted builder emitted after response.completed")
 	}
 }
@@ -505,5 +536,30 @@ func TestChatStreamRejectsToolCallIDDrift(t *testing.T) {
 	}
 	if _, err := llmux.Collect(stream); err == nil {
 		t.Fatal("chat tool index changed call IDs")
+	}
+}
+
+func TestDeepSeekUsageIsInclusiveAndReportsExplicitZeroCache(t *testing.T) {
+	zero := 0
+	wire := chatUsage{PromptTokens: 5, CompletionTokens: 3}
+	wire.PromptDetails.CachedTokens = &zero
+	got := normalizeProfileUsage(usageFromChat(wire), CompatProfile{DeepSeek: true})
+	if got.InputTokens != 5 || got.TotalTokens != 8 || !got.CachedInputTokensReported {
+		t.Fatalf("zero-cache usage = %#v", got)
+	}
+	cache := 4
+	wire.PromptDetails.CachedTokens = &cache
+	got = normalizeProfileUsage(usageFromChat(wire), CompatProfile{DeepSeek: true})
+	if got.InputTokens != 9 || got.CachedInputTokens != 4 || got.TotalTokens != 12 {
+		t.Fatalf("cache-hit usage = %#v", got)
+	}
+}
+
+func TestXAIUsageMakesReasoningInclusiveBeforeFinalNormalization(t *testing.T) {
+	got := normalizeProfileUsage(llmux.Usage{
+		InputTokens: 3, OutputTokens: 2, ReasoningTokens: 5,
+	}, CompatProfile{XAI: true})
+	if got.OutputTokens != 7 || got.ReasoningTokens != 5 || got.TotalTokens != 10 {
+		t.Fatalf("xai usage = %#v", got)
 	}
 }

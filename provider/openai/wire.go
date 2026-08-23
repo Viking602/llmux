@@ -97,7 +97,7 @@ func chatMessage(message llmux.Message) (map[string]any, error) {
 	toolCalls := make([]any, 0)
 	for _, part := range message.Content {
 		switch part.Kind {
-		case llmux.ContentText, llmux.ContentReasoning:
+		case llmux.ContentText, llmux.ContentCommentary, llmux.ContentFinalAnswer, llmux.ContentReasoning:
 			blockType := "text"
 			if message.Role == llmux.RoleUser {
 				blockType = "text"
@@ -217,7 +217,7 @@ func responsesItems(message llmux.Message) ([]any, error) {
 		text := ""
 		for _, part := range message.Content {
 			switch part.Kind {
-			case llmux.ContentText:
+			case llmux.ContentText, llmux.ContentCommentary, llmux.ContentFinalAnswer:
 				text += part.Text
 			case llmux.ContentToolCall:
 				if part.ToolCall == nil || !json.Valid(part.ToolCall.Arguments) {
@@ -234,7 +234,7 @@ func responsesItems(message llmux.Message) ([]any, error) {
 	blocks := make([]any, 0, len(message.Content))
 	for _, part := range message.Content {
 		switch part.Kind {
-		case llmux.ContentText:
+		case llmux.ContentText, llmux.ContentCommentary, llmux.ContentFinalAnswer:
 			blocks = append(blocks, map[string]any{"type": "input_text", "text": part.Text})
 		case llmux.ContentImage:
 			imageURL := part.URL
@@ -533,12 +533,12 @@ type chatUsage struct {
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 	PromptDetails    struct {
-		CachedTokens int `json:"cached_tokens"`
+		CachedTokens *int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
 	PromptDetail struct {
-		CachedTokens int `json:"cached_tokens"`
+		CachedTokens *int `json:"cached_tokens"`
 	} `json:"prompt_token_details"`
-	NumCachedTokens   int `json:"num_cached_tokens"`
+	NumCachedTokens   *int `json:"num_cached_tokens"`
 	CompletionDetails struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details"`
@@ -697,7 +697,7 @@ func mapResponsesUsage(usage responsesUsage) llmux.Usage {
 		result.CacheWriteInputTokens = *usage.InputDetails.CacheWriteTokens
 		result.CacheWriteInputTokensReported = true
 	}
-	return result
+	return llmux.NormalizeUsage(result)
 }
 
 func parseResponsesResult(payload []byte) (llmux.Result, error) {
@@ -712,12 +712,13 @@ func parseResponsesResult(payload []byte) (llmux.Result, error) {
 	result.Usage = mapResponsesUsage(response.Usage)
 	for _, raw := range response.Output {
 		var item struct {
-			Type      string  `json:"type"`
-			ID        string  `json:"id"`
-			CallID    string  `json:"call_id"`
-			Name      string  `json:"name"`
-			Input     *string `json:"input"`
-			Arguments string  `json:"arguments"`
+			Type      string          `json:"type"`
+			ID        string          `json:"id"`
+			CallID    string          `json:"call_id"`
+			Name      string          `json:"name"`
+			Input     *string         `json:"input"`
+			Arguments string          `json:"arguments"`
+			Phase     llmux.TextPhase `json:"phase"`
 			Summary   []struct {
 				Text string `json:"text"`
 			} `json:"summary"`
@@ -731,14 +732,20 @@ func parseResponsesResult(payload []byte) (llmux.Result, error) {
 		}
 		switch item.Type {
 		case "message":
+			kind := llmux.ContentFinalAnswer
+			if item.Phase == llmux.TextPhaseCommentary {
+				kind = llmux.ContentCommentary
+			}
 			for _, block := range item.Content {
-				if block.Type == "output_text" {
+				if block.Type == "output_text" || block.Type == "refusal" {
 					result.Text += block.Text
+					result.Content = append(result.Content, llmux.ContentPart{Kind: kind, Text: block.Text})
 				}
 			}
 		case "reasoning":
 			for _, block := range item.Summary {
 				result.Reasoning += block.Text
+				result.Content = append(result.Content, llmux.ContentPart{Kind: llmux.ContentReasoning, Text: block.Text})
 			}
 		case "function_call":
 			arguments := json.RawMessage(item.Arguments)
@@ -757,12 +764,6 @@ func parseResponsesResult(payload []byte) (llmux.Result, error) {
 			result.ToolCalls = append(result.ToolCalls, call)
 			result.Content = append(result.Content, llmux.ContentPart{Kind: llmux.ContentToolCall, ToolCall: &call})
 		}
-	}
-	if result.Text != "" {
-		result.Content = append([]llmux.ContentPart{{Kind: llmux.ContentText, Text: result.Text}}, result.Content...)
-	}
-	if result.Reasoning != "" {
-		result.Content = append([]llmux.ContentPart{{Kind: llmux.ContentReasoning, Text: result.Reasoning}}, result.Content...)
 	}
 	result.FinishReason, result.RawFinishReason = responsesFinish(response)
 	return result, nil
@@ -799,8 +800,28 @@ func finishReason(raw string) llmux.FinishReason {
 }
 
 func usageFromChat(usage chatUsage) llmux.Usage {
-	cached := max(usage.PromptDetails.CachedTokens, usage.PromptDetail.CachedTokens, usage.NumCachedTokens)
-	return llmux.Usage{InputTokens: usage.PromptTokens, CachedInputTokens: cached, OutputTokens: usage.CompletionTokens, ReasoningTokens: usage.CompletionDetails.ReasoningTokens, TotalTokens: usage.TotalTokens}
+	cached, reported := maximumReported(usage.PromptDetails.CachedTokens, usage.PromptDetail.CachedTokens, usage.NumCachedTokens)
+	return llmux.NormalizeUsage(llmux.Usage{
+		InputTokens:               usage.PromptTokens,
+		CachedInputTokens:         cached,
+		CachedInputTokensReported: reported,
+		OutputTokens:              usage.CompletionTokens,
+		ReasoningTokens:           usage.CompletionDetails.ReasoningTokens,
+		TotalTokens:               usage.TotalTokens,
+	})
+}
+
+func maximumReported(values ...*int) (int, bool) {
+	maximum := 0
+	reported := false
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		reported = true
+		maximum = max(maximum, *value)
+	}
+	return maximum, reported
 }
 
 func mustMarshal(value any) json.RawMessage {

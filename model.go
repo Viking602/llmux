@@ -2,6 +2,8 @@ package llmux
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"time"
 )
@@ -22,6 +24,8 @@ type ContentKind string
 
 const (
 	ContentText         ContentKind = "text"
+	ContentCommentary   ContentKind = "commentary"
+	ContentFinalAnswer  ContentKind = "final_answer"
 	ContentReasoning    ContentKind = "reasoning"
 	ContentImage        ContentKind = "image"
 	ContentAudio        ContentKind = "audio"
@@ -72,6 +76,19 @@ type ToolCall struct {
 	Arguments        json.RawMessage `json:"arguments,omitempty"`
 	ProviderExecuted *bool           `json:"providerExecuted,omitempty"`
 	Dynamic          *bool           `json:"dynamic,omitempty"`
+}
+
+// NewGeneratedToolCallID creates a collision-resistant host identity for a
+// protocol-allowed tool call whose provider omitted its ID.
+func NewGeneratedToolCallID(prefix string) (string, error) {
+	var entropy [16]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", err
+	}
+	if prefix == "" {
+		prefix = "llmux"
+	}
+	return prefix + "-generated-" + hex.EncodeToString(entropy[:]), nil
 }
 
 type ToolResult struct {
@@ -171,6 +188,55 @@ type Usage struct {
 	Raw                           json.RawMessage `json:"raw,omitempty"`
 }
 
+// NormalizeUsage applies one portable accounting convention across providers:
+// input includes cache reads/writes, output includes reasoning, reported flags
+// preserve explicit zero, and total is never below input plus output.
+func NormalizeUsage(usage Usage) Usage {
+	usage.InputTokens = max(0, usage.InputTokens)
+	usage.CachedInputTokens = max(0, usage.CachedInputTokens)
+	usage.CacheWriteInputTokens = max(0, usage.CacheWriteInputTokens)
+	usage.OutputTokens = max(0, usage.OutputTokens)
+	usage.ReasoningTokens = max(0, usage.ReasoningTokens)
+	usage.CachedInputTokensReported = usage.CachedInputTokensReported || usage.CachedInputTokens > 0
+	usage.CacheWriteInputTokensReported = usage.CacheWriteInputTokensReported || usage.CacheWriteInputTokens > 0
+	usage.TotalTokens = max(max(0, usage.TotalTokens), saturatingTokenAdd(usage.InputTokens, usage.OutputTokens))
+	return usage
+}
+
+// AddUsage combines independently reported usage without integer overflow.
+func AddUsage(left, right Usage) Usage {
+	left = NormalizeUsage(left)
+	right = NormalizeUsage(right)
+	return NormalizeUsage(Usage{
+		InputTokens:                   saturatingTokenAdd(left.InputTokens, right.InputTokens),
+		CachedInputTokens:             saturatingTokenAdd(left.CachedInputTokens, right.CachedInputTokens),
+		CachedInputTokensReported:     left.CachedInputTokensReported || right.CachedInputTokensReported,
+		CacheWriteInputTokens:         saturatingTokenAdd(left.CacheWriteInputTokens, right.CacheWriteInputTokens),
+		CacheWriteInputTokensReported: left.CacheWriteInputTokensReported || right.CacheWriteInputTokensReported,
+		OutputTokens:                  saturatingTokenAdd(left.OutputTokens, right.OutputTokens),
+		ReasoningTokens:               saturatingTokenAdd(left.ReasoningTokens, right.ReasoningTokens),
+		TotalTokens:                   saturatingTokenAdd(left.TotalTokens, right.TotalTokens),
+	})
+}
+
+func saturatingTokenAdd(left, right int) int {
+	const maxInt = int(^uint(0) >> 1)
+	if right > 0 && left >= maxInt-right {
+		return maxInt
+	}
+	return left + right
+}
+
+// SaturatingTokenSum adds untrusted provider counters after clamping each
+// component to zero.
+func SaturatingTokenSum(values ...int) int {
+	total := 0
+	for _, value := range values {
+		total = saturatingTokenAdd(total, max(0, value))
+	}
+	return total
+}
+
 type FinishReason string
 
 const (
@@ -217,14 +283,123 @@ type Provider interface {
 	LanguageModel(modelID string) (LanguageModel, error)
 }
 
+type ProviderCapability string
+
+const (
+	CapabilityLanguage      ProviderCapability = "language"
+	CapabilityModelListing  ProviderCapability = "model_listing"
+	CapabilityEmbedding     ProviderCapability = "embedding"
+	CapabilityReranking     ProviderCapability = "reranking"
+	CapabilitySpeech        ProviderCapability = "speech"
+	CapabilityTranscription ProviderCapability = "transcription"
+	CapabilityImage         ProviderCapability = "image"
+	CapabilityVideo         ProviderCapability = "video"
+	CapabilityFiles         ProviderCapability = "files"
+	CapabilitySearch        ProviderCapability = "search"
+)
+
+// ProviderDescriptor is a secret-free portable compatibility declaration.
+type ProviderDescriptor struct {
+	Name           string               `json:"name"`
+	WireProtocols  []string             `json:"wireProtocols,omitempty"`
+	Authentication []string             `json:"authentication,omitempty"`
+	Capabilities   []ProviderCapability `json:"capabilities,omitempty"`
+}
+
+type ProviderDescriber interface {
+	Descriptor() ProviderDescriptor
+}
+
+// DescribeProvider combines a provider's explicit wire descriptor with the
+// optional portable interfaces it actually implements.
+func DescribeProvider(provider Provider) (ProviderDescriptor, error) {
+	if provider == nil {
+		return ProviderDescriptor{}, &ProviderError{Kind: ErrorInvalidRequest, Message: "provider is nil"}
+	}
+	descriptor := ProviderDescriptor{Name: provider.Name()}
+	if described, ok := provider.(ProviderDescriber); ok {
+		descriptor = described.Descriptor()
+		if descriptor.Name == "" {
+			descriptor.Name = provider.Name()
+		}
+	}
+	descriptor.Capabilities = appendProviderCapability(descriptor.Capabilities, CapabilityLanguage)
+	for _, current := range []struct {
+		capability ProviderCapability
+		supported  bool
+	}{
+		{CapabilityModelListing, implements[ModelLister](provider)},
+		{CapabilityEmbedding, implements[EmbeddingProvider](provider)},
+		{CapabilityReranking, implements[RerankingProvider](provider)},
+		{CapabilitySpeech, implements[SpeechProvider](provider)},
+		{CapabilityTranscription, implements[TranscriptionProvider](provider)},
+		{CapabilityImage, implements[ImageProvider](provider)},
+		{CapabilityVideo, implements[VideoProvider](provider)},
+		{CapabilityFiles, implements[FilesProvider](provider)},
+		{CapabilitySearch, implements[SearchProvider](provider)},
+	} {
+		capability, supported := current.capability, current.supported
+		if supported {
+			descriptor.Capabilities = appendProviderCapability(descriptor.Capabilities, capability)
+		}
+	}
+	return descriptor, nil
+}
+
+func implements[Contract any](value any) bool {
+	_, ok := value.(Contract)
+	return ok
+}
+
+func appendProviderCapability(capabilities []ProviderCapability, capability ProviderCapability) []ProviderCapability {
+	for _, current := range capabilities {
+		if current == capability {
+			return capabilities
+		}
+	}
+	return append(capabilities, capability)
+}
+
+// Modality names one portable model input or output channel.
+type Modality string
+
+const (
+	ModalityText          Modality = "text"
+	ModalityImage         Modality = "image"
+	ModalityAudio         Modality = "audio"
+	ModalityVideo         Modality = "video"
+	ModalityFile          Modality = "file"
+	ModalityEmbedding     Modality = "embedding"
+	ModalityReranking     Modality = "reranking"
+	ModalitySpeech        Modality = "speech"
+	ModalityTranscription Modality = "transcription"
+	ModalitySearch        Modality = "search"
+)
+
+// ModelCapabilities retains explicit provider support separately from unknown
+// metadata. Nil booleans mean the provider did not report the capability.
+type ModelCapabilities struct {
+	InputModalities  []Modality `json:"inputModalities,omitempty"`
+	OutputModalities []Modality `json:"outputModalities,omitempty"`
+	ContextWindow    int        `json:"contextWindow,omitempty"`
+	MaxOutputTokens  int        `json:"maxOutputTokens,omitempty"`
+	ToolCalling      *bool      `json:"toolCalling,omitempty"`
+	Reasoning        *bool      `json:"reasoning,omitempty"`
+	StructuredOutput *bool      `json:"structuredOutput,omitempty"`
+	Streaming        *bool      `json:"streaming,omitempty"`
+}
+
 // ModelInfo is a portable entry from a provider List Models response.
 // Raw retains the provider payload for callers that need extra fields.
 type ModelInfo struct {
-	ID          string          `json:"id"`
-	DisplayName string          `json:"displayName,omitempty"`
-	OwnedBy     string          `json:"ownedBy,omitempty"`
-	Created     int64           `json:"created,omitempty"`
-	Raw         json.RawMessage `json:"raw,omitempty"`
+	ID           string             `json:"id"`
+	DisplayName  string             `json:"displayName,omitempty"`
+	Description  string             `json:"description,omitempty"`
+	Family       string             `json:"family,omitempty"`
+	OwnedBy      string             `json:"ownedBy,omitempty"`
+	Created      int64              `json:"created,omitempty"`
+	Capabilities *ModelCapabilities `json:"capabilities,omitempty"`
+	Raw          json.RawMessage    `json:"raw,omitempty"`
 }
 
 // ModelLister is an optional capability. Providers that expose a models

@@ -121,6 +121,21 @@ func New(config Config) (*Provider, error) {
 
 func (provider *Provider) Name() string { return provider.config.ProviderName }
 
+func (provider *Provider) Descriptor() llmux.ProviderDescriptor {
+	authentication := "api-key"
+	if strings.EqualFold(provider.config.APIKeyHeader, "Authorization") {
+		authentication = "authorization-header"
+		if strings.EqualFold(strings.TrimSpace(provider.config.APIKeyPrefix), "Bearer") {
+			authentication = "bearer"
+		}
+	}
+	return llmux.ProviderDescriptor{
+		Name:           provider.Name(),
+		WireProtocols:  []string{string(provider.config.WireAPI)},
+		Authentication: []string{authentication},
+	}
+}
+
 func (provider *Provider) LanguageModel(modelID string) (llmux.LanguageModel, error) {
 	if strings.TrimSpace(modelID) == "" {
 		return nil, errors.New("openai: model ID is empty")
@@ -163,18 +178,31 @@ func (model *model) Generate(ctx context.Context, request llmux.Request) (llmux.
 		return llmux.Result{}, &llmux.ProviderError{Provider: model.provider.Name(), Kind: llmux.ErrorStream, Message: err.Error(), Cause: err}
 	}
 	result.Response.Headers = selectedHeaders(response.Header)
-	if model.provider.config.Profile.XAI {
-		if result.Usage.CachedInputTokens > result.Usage.InputTokens {
-			result.Usage.InputTokens += result.Usage.CachedInputTokens
-		}
-		result.Usage.OutputTokens += result.Usage.ReasoningTokens
-		result.Usage.TotalTokens = result.Usage.InputTokens + result.Usage.OutputTokens
-	}
+	result.Usage = normalizeProfileUsage(result.Usage, *model.provider.config.Profile)
 	result.Warnings = append(result.Warnings, model.profileWarnings(request.Options)...)
 	if request.Options.IncludeRawChunks {
 		result.Raw = append(json.RawMessage(nil), payload...)
 	}
-	return result, nil
+	return llmux.ConformResult(result)
+}
+
+func normalizeProfileUsage(usage llmux.Usage, profile CompatProfile) llmux.Usage {
+	usage = llmux.NormalizeUsage(usage)
+	if profile.DeepSeek {
+		usage.InputTokens = llmux.SaturatingTokenSum(
+			usage.InputTokens,
+			usage.CachedInputTokens,
+			usage.CacheWriteInputTokens,
+		)
+	}
+	if profile.XAI {
+		if usage.CachedInputTokens > usage.InputTokens {
+			usage.InputTokens = llmux.SaturatingTokenSum(usage.InputTokens, usage.CachedInputTokens)
+		}
+		usage.OutputTokens = llmux.SaturatingTokenSum(usage.OutputTokens, usage.ReasoningTokens)
+	}
+	usage.TotalTokens = llmux.SaturatingTokenSum(usage.InputTokens, usage.OutputTokens)
+	return llmux.NormalizeUsage(usage)
 }
 
 func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.Stream, error) {
@@ -222,9 +250,9 @@ func (model *model) Stream(ctx context.Context, request llmux.Request) (llmux.St
 	}
 	metadata := llmux.ResponseMetadata{ModelID: model.id, Headers: selectedHeaders(response.Header)}
 	if model.provider.config.WireAPI == Responses {
-		return newResponsesStream(streamCtx, cancel, response.Body, model.provider.Name(), metadata, request.Options.IncludeRawChunks, model.profileWarnings(request.Options)), nil
+		return llmux.ConformStream(newResponsesStream(streamCtx, cancel, response.Body, model.provider.Name(), metadata, request.Options.IncludeRawChunks, *model.provider.config.Profile, model.profileWarnings(request.Options))), nil
 	}
-	return newChatStream(streamCtx, cancel, response.Body, model.provider.Name(), metadata, request.Options.IncludeRawChunks, *model.provider.config.Profile, model.profileWarnings(request.Options)), nil
+	return llmux.ConformStream(newChatStream(streamCtx, cancel, response.Body, model.provider.Name(), metadata, request.Options.IncludeRawChunks, *model.provider.config.Profile, model.profileWarnings(request.Options))), nil
 }
 
 func (model *model) profileWarnings(options llmux.CallOptions) []string {

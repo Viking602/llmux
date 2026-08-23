@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+
+	"github.com/Viking602/llmux"
 )
 
 func TestListModelsPaginates(t *testing.T) {
@@ -40,5 +42,26 @@ func TestListModelsPaginates(t *testing.T) {
 	}
 	if len(models) != 2 || models[0].ID != "gemini-a" || models[1].ID != "gemini-b" || models[0].DisplayName != "A" {
 		t.Fatalf("models = %#v", models)
+	}
+}
+
+func TestParseGoogleModelCapabilitiesDistinguishesGenerationEmbeddingAndUnknown(t *testing.T) {
+	models, _, err := parseGoogleModelPage([]byte(`{"models":[
+		{"name":"models/gemini","supportedGenerationMethods":["generateContent","streamGenerateContent"],"inputTokenLimit":100,"outputTokenLimit":20},
+		{"name":"models/embed","supportedGenerationMethods":["embedContent"]},
+		{"name":"models/unknown"}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if models[0].Capabilities == nil || models[0].Capabilities.Streaming == nil ||
+		!*models[0].Capabilities.Streaming || models[0].Capabilities.OutputModalities[0] != llmux.ModalityText {
+		t.Fatalf("generation capabilities = %#v", models[0].Capabilities)
+	}
+	if models[1].Capabilities == nil || models[1].Capabilities.OutputModalities[0] != llmux.ModalityEmbedding {
+		t.Fatalf("embedding capabilities = %#v", models[1].Capabilities)
+	}
+	if models[2].Capabilities != nil {
+		t.Fatalf("unknown capabilities = %#v", models[2].Capabilities)
 	}
 }

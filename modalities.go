@@ -223,3 +223,112 @@ type SearchResult struct {
 type SearchModel interface {
 	Search(context.Context, SearchRequest) (SearchResult, error)
 }
+
+// Optional provider factories expose non-language modalities without bloating
+// the base Provider interface.
+type EmbeddingProvider interface {
+	EmbeddingModel(modelID string) (EmbeddingModel, error)
+}
+
+type RerankingProvider interface {
+	RerankingModel(modelID string) (RerankingModel, error)
+}
+
+type SpeechProvider interface {
+	SpeechModel(modelID string) (SpeechModel, error)
+}
+
+type TranscriptionProvider interface {
+	TranscriptionModel(modelID string) (TranscriptionModel, error)
+}
+
+type ImageProvider interface {
+	ImageModel(modelID string) (ImageModel, error)
+}
+
+type VideoProvider interface {
+	VideoModel(modelID string) (VideoModel, error)
+}
+
+type SearchProvider interface {
+	SearchModel(modelID string) (SearchModel, error)
+}
+
+type FilesProvider interface {
+	Files() Files
+}
+
+func OpenEmbeddingModel(provider Provider, modelID string) (EmbeddingModel, error) {
+	factory, ok := provider.(EmbeddingProvider)
+	if !ok {
+		return nil, unsupportedProviderCapability(provider, "embedding models")
+	}
+	return factory.EmbeddingModel(modelID)
+}
+
+func OpenRerankingModel(provider Provider, modelID string) (RerankingModel, error) {
+	factory, ok := provider.(RerankingProvider)
+	if !ok {
+		return nil, unsupportedProviderCapability(provider, "reranking models")
+	}
+	return factory.RerankingModel(modelID)
+}
+
+func OpenSpeechModel(provider Provider, modelID string) (SpeechModel, error) {
+	factory, ok := provider.(SpeechProvider)
+	if !ok {
+		return nil, unsupportedProviderCapability(provider, "speech models")
+	}
+	return factory.SpeechModel(modelID)
+}
+
+func OpenTranscriptionModel(provider Provider, modelID string) (TranscriptionModel, error) {
+	factory, ok := provider.(TranscriptionProvider)
+	if !ok {
+		return nil, unsupportedProviderCapability(provider, "transcription models")
+	}
+	return factory.TranscriptionModel(modelID)
+}
+
+func OpenImageModel(provider Provider, modelID string) (ImageModel, error) {
+	factory, ok := provider.(ImageProvider)
+	if !ok {
+		return nil, unsupportedProviderCapability(provider, "image models")
+	}
+	return factory.ImageModel(modelID)
+}
+
+func OpenVideoModel(provider Provider, modelID string) (VideoModel, error) {
+	factory, ok := provider.(VideoProvider)
+	if !ok {
+		return nil, unsupportedProviderCapability(provider, "video models")
+	}
+	return factory.VideoModel(modelID)
+}
+
+func OpenSearchModel(provider Provider, modelID string) (SearchModel, error) {
+	factory, ok := provider.(SearchProvider)
+	if !ok {
+		return nil, unsupportedProviderCapability(provider, "search models")
+	}
+	return factory.SearchModel(modelID)
+}
+
+func OpenFiles(provider Provider) (Files, error) {
+	factory, ok := provider.(FilesProvider)
+	if !ok {
+		return nil, unsupportedProviderCapability(provider, "files")
+	}
+	return factory.Files(), nil
+}
+
+func unsupportedProviderCapability(provider Provider, capability string) error {
+	if provider == nil {
+		return &ProviderError{Kind: ErrorInvalidRequest, Message: "provider is nil"}
+	}
+	return &ProviderError{
+		Provider: provider.Name(),
+		Kind:     ErrorUnsupported,
+		Message:  capability + " are not supported by this provider",
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Viking602/llmux"
 	opencompat "github.com/Viking602/llmux/provider/openai/compat"
 )
 
@@ -49,6 +50,48 @@ type Provider struct {
 	Backend      Backend      `json:"backend"`
 	Capabilities []Capability `json:"capabilities"`
 	Generated    bool         `json:"generated,omitempty"`
+}
+
+func (provider Provider) Descriptor() llmux.ProviderDescriptor {
+	descriptor := llmux.ProviderDescriptor{
+		Name:          provider.ID,
+		WireProtocols: []string{string(provider.Backend)},
+	}
+	for _, capability := range provider.Capabilities {
+		mapped, ok := portableCapability(capability)
+		if !ok {
+			continue
+		}
+		descriptor.Capabilities = append(descriptor.Capabilities, mapped)
+	}
+	return descriptor
+}
+
+func portableCapability(capability Capability) (llmux.ProviderCapability, bool) {
+	switch capability {
+	case Language:
+		return llmux.CapabilityLanguage, true
+	case ListModels:
+		return llmux.CapabilityModelListing, true
+	case Embedding:
+		return llmux.CapabilityEmbedding, true
+	case Reranking:
+		return llmux.CapabilityReranking, true
+	case Speech:
+		return llmux.CapabilitySpeech, true
+	case Transcription:
+		return llmux.CapabilityTranscription, true
+	case Image:
+		return llmux.CapabilityImage, true
+	case Video:
+		return llmux.CapabilityVideo, true
+	case Files:
+		return llmux.CapabilityFiles, true
+	case Search:
+		return llmux.CapabilitySearch, true
+	default:
+		return "", false
+	}
 }
 
 func Lookup(id string) (Provider, bool) {

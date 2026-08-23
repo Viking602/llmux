@@ -40,6 +40,7 @@ type converseStream struct {
 	closeOnce     sync.Once
 	toolCalls     internalstream.ToolCallTracker
 	toolBudget    internalstream.ToolCallBudget
+	stateBudget   internalstream.StateBudget
 	activeToolIDs map[string]int
 }
 
@@ -96,6 +97,11 @@ func (stream *converseStream) Recv() (llmux.Part, error) {
 func (stream *converseStream) mapEvent(event eventMessage) error {
 	if stream.stopped && event.EventType != "messageStop" && event.EventType != "metadata" {
 		return fmt.Errorf("Bedrock event %q arrived after messageStop", event.EventType)
+	}
+	if len(event.Payload) > 0 {
+		if err := internalstream.ValidateJSONComplexity(event.Payload); err != nil {
+			return err
+		}
 	}
 	switch event.EventType {
 	case "messageStart":
@@ -176,7 +182,12 @@ func (stream *converseStream) mapEvent(event eventMessage) error {
 				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartReasoningStart, ID: indexID(payload.ContentBlockIndex)})
 			}
 			builder.text.WriteString(payload.Delta.Reasoning.Text)
-			builder.signature.WriteString(payload.Delta.Reasoning.Signature)
+			if payload.Delta.Reasoning.Signature != "" || payload.Delta.Reasoning.Text == "" {
+				if err := stream.stateBudget.Retain(len(payload.Delta.Reasoning.Signature)); err != nil {
+					return fmt.Errorf("Bedrock %w", err)
+				}
+				builder.signature.WriteString(payload.Delta.Reasoning.Signature)
+			}
 			if payload.Delta.Reasoning.Text != "" {
 				stream.pending = append(stream.pending, llmux.Part{Kind: llmux.PartReasoningDelta, ID: indexID(payload.ContentBlockIndex), Delta: payload.Delta.Reasoning.Text})
 			}
