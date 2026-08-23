@@ -563,3 +563,25 @@ func TestXAIUsageMakesReasoningInclusiveBeforeFinalNormalization(t *testing.T) {
 		t.Fatalf("xai usage = %#v", got)
 	}
 }
+
+func TestPortableAffinityOptionsReachOpenAIWire(t *testing.T) {
+	provider, err := New(Config{APIKey: "test", WireAPI: Responses})
+	if err != nil {
+		t.Fatal(err)
+	}
+	languageModel, _ := provider.LanguageModel("gpt-test")
+	body, err := languageModel.(*model).build(llmux.Request{Options: llmux.CallOptions{
+		PromptCacheKey: "session:one",
+		ServiceTier:    "priority",
+	}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["prompt_cache_key"] != "session:one" || wire["service_tier"] != "priority" {
+		t.Fatalf("wire affinity options = %#v", wire)
+	}
+}

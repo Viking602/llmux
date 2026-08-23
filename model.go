@@ -160,6 +160,8 @@ type CallOptions struct {
 	Tools             []ToolDefinition           `json:"tools,omitempty"`
 	ToolChoice        *ToolChoice                `json:"toolChoice,omitempty"`
 	ParallelToolCalls *bool                      `json:"parallelToolCalls,omitempty"`
+	PromptCacheKey    string                     `json:"promptCacheKey,omitempty"`
+	ServiceTier       string                     `json:"serviceTier,omitempty"`
 	Reasoning         *ReasoningOptions          `json:"reasoning,omitempty"`
 	ResponseFormat    *ResponseFormat            `json:"responseFormat,omitempty"`
 	Headers           map[string]string          `json:"headers,omitempty"`

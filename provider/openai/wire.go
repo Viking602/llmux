@@ -307,6 +307,12 @@ func applyPortableOptions(body map[string]any, options llmux.CallOptions, respon
 	if options.Seed != nil {
 		body["seed"] = *options.Seed
 	}
+	if promptCacheKey := strings.TrimSpace(options.PromptCacheKey); promptCacheKey != "" {
+		body["prompt_cache_key"] = promptCacheKey
+	}
+	if serviceTier := strings.TrimSpace(options.ServiceTier); serviceTier != "" {
+		body["service_tier"] = serviceTier
+	}
 	if len(options.Tools) > 0 && profile.SupportsTools {
 		tools := make([]any, 0, len(options.Tools))
 		for _, tool := range options.Tools {
