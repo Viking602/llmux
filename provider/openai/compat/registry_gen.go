@@ -162,7 +162,7 @@ var profiles = map[string]Profile{
 	"nextbit":                             {ID: "nextbit", DisplayName: "NextBit", BaseURL: "https://api.nextbit.ai/v1", EnvKey: "NEXTBIT_API_KEY", Behavior: BehaviorFull},
 	"nlp-cloud":                           {ID: "nlp-cloud", DisplayName: "NLP Cloud", BaseURL: "https://api.nlpcloud.io/v1", EnvKey: "NLPCLOUD_API_KEY", Behavior: BehaviorFull},
 	"nous-research":                       {ID: "nous-research", DisplayName: "Nous Research", BaseURL: "https://api.nousresearch.com/v1", EnvKey: "NOUS_API_KEY", Behavior: BehaviorFull},
-	"novita":                              {ID: "novita", DisplayName: "Novita AI", BaseURL: "https://api.novita.ai/v1", EnvKey: "NOVITA_API_KEY", Behavior: BehaviorFull},
+	"novita":                              {ID: "novita", DisplayName: "Novita AI", BaseURL: "https://api.novita.ai/openai/v1", EnvKey: "NOVITA_API_KEY", Behavior: BehaviorFull, ExtraProtocols: []Protocol{ProtocolResponses, ProtocolAnthropic}, ProtocolBaseURL: map[Protocol]string{ProtocolAnthropic: "https://api.novita.ai/anthropic"}},
 	"nscale":                              {ID: "nscale", DisplayName: "Nscale", BaseURL: "https://inference.api.nscale.com/v1", EnvKey: "NSCALE_API_KEY", Behavior: BehaviorFull},
 	"nvidia-nim":                          {ID: "nvidia-nim", DisplayName: "NVIDIA NIM", BaseURL: "https://integrate.api.nvidia.com/v1", EnvKey: "NVIDIA_API_KEY", Behavior: BehaviorFull},
 	"oci":                                 {ID: "oci", DisplayName: "OCI", EnvKey: "OCI_API_KEY", Behavior: BehaviorFull},

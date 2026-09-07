@@ -137,3 +137,73 @@ func TestProfileWithoutDefaultURLRequiresOverride(t *testing.T) {
 		t.Fatal("expected explicit base URL error")
 	}
 }
+
+func TestNovitaUsesOpenAIFamilyAndAnthropic(t *testing.T) {
+	profile, ok := Lookup("novita")
+	if !ok || profile.BaseURL != "https://api.novita.ai/openai/v1" {
+		t.Fatalf("novita = %#v/%v", profile, ok)
+	}
+	want := []Protocol{ProtocolChatCompletions, ProtocolResponses, ProtocolAnthropic}
+	got := profile.Protocols()
+	if len(got) != len(want) {
+		t.Fatalf("protocols = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("protocols = %#v, want %#v", got, want)
+		}
+	}
+	if profile.baseURLFor(ProtocolAnthropic) != "https://api.novita.ai/anthropic" {
+		t.Fatalf("anthropic base = %q", profile.baseURLFor(ProtocolAnthropic))
+	}
+	if profile.baseURLFor(ProtocolResponses) != profile.BaseURL {
+		t.Fatalf("responses base = %q", profile.baseURLFor(ProtocolResponses))
+	}
+
+	var saw []string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		saw = append(saw, request.URL.Path)
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/chat/completions"):
+			_, _ = response.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"chat"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		case strings.HasSuffix(request.URL.Path, "/responses"):
+			_, _ = response.Write([]byte(`{"id":"resp-1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"resp"}]}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		case strings.HasSuffix(request.URL.Path, "/messages"):
+			_, _ = response.Write([]byte(`{"id":"msg-1","model":"glm","content":[{"type":"text","text":"anth"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		default:
+			t.Errorf("unexpected path %q", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	for _, tc := range []struct {
+		protocol Protocol
+		wantPath string
+		wantText string
+	}{
+		{ProtocolChatCompletions, "/chat/completions", "chat"},
+		{ProtocolResponses, "/responses", "resp"},
+		{ProtocolAnthropic, "/v1/messages", "anth"},
+	} {
+		saw = nil
+		provider, err := New("novita", Config{APIKey: "test", BaseURL: server.URL, Client: server.Client(), Protocol: tc.protocol})
+		if err != nil {
+			t.Fatalf("%s new: %v", tc.protocol, err)
+		}
+		model, err := provider.LanguageModel("zai-org/glm-5.3-flash")
+		if err != nil {
+			t.Fatalf("%s model: %v", tc.protocol, err)
+		}
+		result, err := model.Generate(context.Background(), llmux.Request{})
+		if err != nil || result.Text != tc.wantText {
+			t.Fatalf("%s result/error = %#v/%v", tc.protocol, result, err)
+		}
+		if len(saw) == 0 || !strings.HasSuffix(saw[0], tc.wantPath) {
+			t.Fatalf("%s path = %#v, want suffix %q", tc.protocol, saw, tc.wantPath)
+		}
+	}
+
+	if _, err := New("novita", Config{APIKey: "test", Protocol: "soap"}); err == nil {
+		t.Fatal("expected unsupported protocol error")
+	}
+}

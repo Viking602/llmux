@@ -70,7 +70,16 @@ subscriptionProvider, err := codex.New(codex.Config{
 inferenceHub, err := compat.New("inferencehub", compat.Config{
     APIKey: os.Getenv("INFERENCEHUB_API_KEY"),
 })
+novita, err := compat.New("novita", compat.Config{
+    APIKey: os.Getenv("NOVITA_API_KEY"),
+})
+novitaAnthropic, err := compat.New("novita", compat.Config{
+    APIKey: os.Getenv("NOVITA_API_KEY"),
+    Protocol: compat.ProtocolAnthropic,
+})
 ```
+
+`compat.New` uses each profile's default wire protocol. When a provider advertises extras, pass `Config.Protocol` (`chat-completions`, `responses`, or `anthropic-messages`). Novita's default is OpenAI Chat Completions at `https://api.novita.ai/openai/v1`; the same profile also serves Responses and Anthropic Messages.
 
 The ChatGPT subscription endpoint is undocumented and best-effort. The caller owns OAuth login, token storage, and the refresh-and-retry loop. `codex.Refresh` performs one non-retried refresh-token exchange.
 
@@ -149,7 +158,16 @@ subscriptionProvider, err := codex.New(codex.Config{
 inferenceHub, err := compat.New("inferencehub", compat.Config{
     APIKey: os.Getenv("INFERENCEHUB_API_KEY"),
 })
+novita, err := compat.New("novita", compat.Config{
+    APIKey: os.Getenv("NOVITA_API_KEY"),
+})
+novitaAnthropic, err := compat.New("novita", compat.Config{
+    APIKey: os.Getenv("NOVITA_API_KEY"),
+    Protocol: compat.ProtocolAnthropic,
+})
 ```
+
+`compat.New` 使用各档案的默认线路协议。若供应商还提供其它协议，可通过 `Config.Protocol` 选择 `chat-completions`、`responses` 或 `anthropic-messages`。Novita 默认走 `https://api.novita.ai/openai/v1` 的 OpenAI Chat Completions，同一档案也支持 Responses 与 Anthropic Messages。
 
 ChatGPT 订阅端点属于未公开、尽力而为的接入方式。调用方负责 OAuth 登录、令牌持久化以及刷新后重试；`codex.Refresh` 只执行一次不重试的刷新令牌交换。
 

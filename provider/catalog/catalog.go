@@ -46,16 +46,21 @@ const (
 )
 
 type Provider struct {
-	ID           string       `json:"id"`
-	Backend      Backend      `json:"backend"`
-	Capabilities []Capability `json:"capabilities"`
-	Generated    bool         `json:"generated,omitempty"`
+	ID            string       `json:"id"`
+	Backend       Backend      `json:"backend"`
+	WireProtocols []string     `json:"wireProtocols,omitempty"`
+	Capabilities  []Capability `json:"capabilities"`
+	Generated     bool         `json:"generated,omitempty"`
 }
 
 func (provider Provider) Descriptor() llmux.ProviderDescriptor {
+	wires := provider.WireProtocols
+	if len(wires) == 0 {
+		wires = []string{string(provider.Backend)}
+	}
 	descriptor := llmux.ProviderDescriptor{
 		Name:          provider.ID,
-		WireProtocols: []string{string(provider.Backend)},
+		WireProtocols: append([]string(nil), wires...),
 	}
 	for _, capability := range provider.Capabilities {
 		mapped, ok := portableCapability(capability)
@@ -131,16 +136,28 @@ func p(id string, backend Backend, capabilities ...Capability) Provider {
 	return Provider{ID: id, Backend: backend, Capabilities: capabilities}
 }
 
-func providerFromProfile(profile opencompat.Profile) Provider {
-	backend := BackendOpenAICompat
-	switch profile.Protocol {
+func backendForProtocol(protocol opencompat.Protocol) Backend {
+	switch protocol {
 	case opencompat.ProtocolResponses:
-		backend = BackendResponses
+		return BackendResponses
 	case opencompat.ProtocolAnthropic:
-		backend = BackendAnthropic
+		return BackendAnthropic
+	default:
+		return BackendOpenAICompat
+	}
+}
+
+func providerFromProfile(profile opencompat.Profile) Provider {
+	protocols := profile.Protocols()
+	wires := make([]string, 0, len(protocols))
+	for _, protocol := range protocols {
+		wires = append(wires, string(backendForProtocol(protocol)))
 	}
 	capabilities := []Capability{Language, ListModels}
-	return Provider{ID: profile.ID, Backend: backend, Capabilities: capabilities, Generated: true}
+	return Provider{
+		ID: profile.ID, Backend: backendForProtocol(protocols[0]),
+		WireProtocols: wires, Capabilities: capabilities, Generated: true,
+	}
 }
 
 var explicit = []Provider{

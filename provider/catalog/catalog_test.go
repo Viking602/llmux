@@ -17,7 +17,7 @@ func TestProviderMatrix(t *testing.T) {
 		}
 		seen[provider.ID] = true
 		descriptor := provider.Descriptor()
-		if descriptor.Name != provider.ID || len(descriptor.WireProtocols) != 1 ||
+		if descriptor.Name != provider.ID || len(descriptor.WireProtocols) == 0 ||
 			len(descriptor.Capabilities) != len(provider.Capabilities) {
 			t.Fatalf("portable descriptor drift for %s: %#v", provider.ID, descriptor)
 		}
@@ -52,6 +52,26 @@ func TestProviderMatrix(t *testing.T) {
 		provider, ok := Lookup(id)
 		if !ok || hasCapability(provider, ListModels) {
 			t.Fatalf("%s should not advertise list_models capability", id)
+		}
+	}
+}
+
+func TestNovitaAdvertisesOpenAIFamilyAndAnthropic(t *testing.T) {
+	provider, ok := Lookup("novita")
+	if !ok {
+		t.Fatal("missing novita")
+	}
+	if provider.Backend != BackendOpenAICompat {
+		t.Fatalf("novita default backend = %q", provider.Backend)
+	}
+	want := []string{string(BackendOpenAICompat), string(BackendResponses), string(BackendAnthropic)}
+	got := provider.Descriptor().WireProtocols
+	if len(got) != len(want) {
+		t.Fatalf("novita wire protocols = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("novita wire protocols = %#v, want %#v", got, want)
 		}
 	}
 }
