@@ -171,6 +171,12 @@ novitaAnthropic, err := compat.New("novita", compat.Config{
 
 ChatGPT 订阅端点属于未公开、尽力而为的接入方式。调用方负责 OAuth 登录、令牌持久化以及刷新后重试；`codex.Refresh` 只执行一次不重试的刷新令牌交换。
 
+### Vercel Evaluation
+
+`provider/vercel.New(Config{APIKey: ..., Client: ...})` 的 `EvaluationModel("typesafe-ai/jev")` 实现独立的 `llmux.EvaluationModel`。调用 `Evaluate(ctx, EvaluationRequest{State: json.RawMessage(...), Questions: ...})` 返回 choice、boolean 或 score 的类型化答案与用量；它不实现聊天生成、流式输出或工具调用。
+
+协议按 [Vercel AI SDK gateway 4.0.85](https://github.com/vercel/ai/blob/main/packages/gateway/src/gateway-evaluation-model.ts) 的 v4 evaluation-model 请求实现，默认基址为 `https://ai-gateway.vercel.sh/v4/ai`。问题与答案在边界验证；评估请求仅发送一次，调用方处理明确失败与未知结果，不自动重放计费请求。
+
 ### 验证
 
 ```bash
