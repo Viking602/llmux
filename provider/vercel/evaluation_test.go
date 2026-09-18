@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Viking602/llmux"
 )
@@ -26,6 +27,7 @@ func TestEvaluationWireAndFailureBoundaries(t *testing.T) {
 	}{
 		{"success", 200, valid, true},
 		{"authentication", 401, `secret must not leak`, false},
+		{"rate_limit_detail", 429, `{"error":{"code":"rate_limit_exceeded","message":"Evaluation request rate exceeded"},"request":{"state":"not diagnostic"}}`, false},
 		{"server_no_retry", 500, `server`, false},
 		{"missing_answers", 200, `{"answers":{}}`, false},
 		{"bad_probability", 200, `{"answers":{"contract":{"type":"choice","choice":"HIT"},"verified":{"type":"boolean","probability":2},"quality":{"type":"score","score":0}}}`, false},
@@ -42,6 +44,7 @@ func TestEvaluationWireAndFailureBoundaries(t *testing.T) {
 					t.Error("wrong evaluation body")
 				}
 				w.Header().Set("x-request-id", "evaluation-1")
+				w.Header().Set("Retry-After", "3")
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(tc.body))
 			}))
@@ -62,6 +65,12 @@ func TestEvaluationWireAndFailureBoundaries(t *testing.T) {
 				var e *llmux.ProviderError
 				if !errors.As(err, &e) || e.StatusCode != 401 || e.Message != "" || e.Raw != nil {
 					t.Fatal("unsafe provider error")
+				}
+			}
+			if tc.status == 429 {
+				var e *llmux.ProviderError
+				if !errors.As(err, &e) || e.StatusCode != 429 || e.Code != "rate_limit_exceeded" || e.Message != "Evaluation request rate exceeded" || e.RetryAfter != 3*time.Second || e.Raw != nil {
+					t.Fatal("upstream diagnostic lost or raw body retained")
 				}
 			}
 			bad := input

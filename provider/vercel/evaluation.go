@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Viking602/llmux"
 	"github.com/Viking602/llmux/internal/httpx"
@@ -86,7 +88,33 @@ func (model *evaluationModel) Evaluate(ctx context.Context, input llmux.Evaluati
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return result, &llmux.ProviderError{Provider: model.provider.Name(), Kind: llmux.ErrorKindForStatus(response.StatusCode), StatusCode: response.StatusCode, Code: "EVALUATION_REJECTED"}
+		upstream := &llmux.ProviderError{Provider: model.provider.Name(), Kind: llmux.ErrorKindForStatus(response.StatusCode), StatusCode: response.StatusCode, Code: "EVALUATION_REJECTED"}
+		var body struct {
+			Error struct {
+				Message string `json:"message"`
+				Code    string `json:"code"`
+			} `json:"error"`
+			Message string `json:"message"`
+		}
+		// Only explicit diagnostic fields; no arbitrary body or HTML fallback.
+		if json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&body) == nil {
+			upstream.Message = body.Error.Message
+			if upstream.Message == "" {
+				upstream.Message = body.Message
+			}
+			if body.Error.Code != "" {
+				upstream.Code = body.Error.Code
+			}
+			if len(upstream.Message) > 8192 {
+				upstream.Message = upstream.Message[:8192]
+			}
+		}
+		if seconds, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil && seconds > 0 {
+			upstream.RetryAfter = time.Duration(min(seconds, 86400)) * time.Second
+		} else if at, err := http.ParseTime(response.Header.Get("Retry-After")); err == nil {
+			upstream.RetryAfter = max(0, min(time.Until(at), 24*time.Hour))
+		}
+		return result, upstream
 	}
 	const maxResponseBytes = 4 << 20
 	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
