@@ -8,7 +8,7 @@ English | [简体中文](#简体中文)
 
 Implemented:
 
-- Native adapters for OpenAI, OpenAI Codex, Anthropic, Google, Vertex AI, Amazon Bedrock, Azure OpenAI, Cohere, Mistral, xAI, DeepSeek, OpenResponses, Voyage AI, and Tavily
+- Native adapters for OpenAI, OpenAI Codex, Anthropic, Google, Vertex AI, Amazon Bedrock, Azure OpenAI, Cohere, Mistral, xAI, DeepSeek, OpenResponses, Voyage AI, Tavily, and TypeSafe AI (Jev)
 - A generic provider registry, including InferenceHub, that prefers the Responses API when available, then Anthropic Messages, and finally Chat Completions
 - Text generation, phased commentary/final answers, reasoning, tool calling,
   embeddings, reranking, speech, transcription, image, video, file, and search
@@ -83,6 +83,14 @@ novitaAnthropic, err := compat.New("novita", compat.Config{
 
 The ChatGPT subscription endpoint is undocumented and best-effort. The caller owns OAuth login, token storage, and the refresh-and-retry loop. `codex.Refresh` performs one non-retried refresh-token exchange.
 
+### TypeSafe AI (Jev)
+
+TypeSafe's Jev uses typed evaluations through `typesafe.New` →
+`llmux.OpenEvaluationModel(provider, typesafe.DefaultModel)` → `Evaluate`.
+It supports Choice, Score, and Noul questions and live model discovery, without
+advertising text generation or streaming. See the [TypeSafe integration guide](provider/typesafe/README.md)
+for a complete Go example, protocol research, and an opt-in live check.
+
 ### Verification
 
 ```bash
@@ -102,7 +110,7 @@ Thanks to the [AIMux](https://github.com/arcships/aimux) project for its provide
 
 当前已实现：
 
-- OpenAI、OpenAI Codex、Anthropic、Google、Vertex AI、Amazon Bedrock、Azure OpenAI、Cohere、Mistral、xAI、DeepSeek、OpenResponses、Voyage AI 与 Tavily 原生适配
+- OpenAI、OpenAI Codex、Anthropic、Google、Vertex AI、Amazon Bedrock、Azure OpenAI、Cohere、Mistral、xAI、DeepSeek、OpenResponses、Voyage AI、Tavily 与 TypeSafe AI（Jev）原生适配
 - 通用供应商注册表（包含 InferenceHub）：优先使用供应商提供的 Responses API，其次使用 Anthropic Messages，最后回退到 Chat Completions
 - 文本生成、分阶段 commentary/final answer、推理、工具调用、向量嵌入、重排序、
   语音、转录、图片、视频、文件与搜索接口，以及可选的供应商模型工厂
@@ -170,6 +178,12 @@ novitaAnthropic, err := compat.New("novita", compat.Config{
 `compat.New` 使用各档案的默认线路协议。若供应商还提供其它协议，可通过 `Config.Protocol` 选择 `chat-completions`、`responses` 或 `anthropic-messages`。Novita 默认走 `https://api.novita.ai/openai/v1` 的 OpenAI Chat Completions，同一档案也支持 Responses 与 Anthropic Messages。
 
 ChatGPT 订阅端点属于未公开、尽力而为的接入方式。调用方负责 OAuth 登录、令牌持久化以及刷新后重试；`codex.Refresh` 只执行一次不重试的刷新令牌交换。
+
+### TypeSafe AI（Jev）
+
+TypeSafe 的 Jev 通过 `typesafe.New` → `llmux.OpenEvaluationModel(provider, typesafe.DefaultModel)` →
+`Evaluate` 调用，支持 Choice、Score、Noul 三种问题和在线模型发现；能力元数据不会宣称文本生成或流式输出。
+完整 Go 示例、协议研究与真实调用检查见 [TypeSafe 接入说明](provider/typesafe/README.md)。
 
 ### 验证
 

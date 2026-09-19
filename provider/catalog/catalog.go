@@ -21,6 +21,7 @@ const (
 	Video         Capability = "video"
 	Search        Capability = "search"
 	Files         Capability = "files"
+	Evaluation    Capability = "evaluation"
 	// ListModels marks providers with a programmatic models discovery API.
 	// Presence is optimistic for openai-compatible gateways; individual
 	// endpoints may still return 404.
@@ -43,6 +44,7 @@ const (
 	BackendXAI          Backend = "xai"
 	BackendResponses    Backend = "open-responses"
 	BackendNativeHTTP   Backend = "native-http"
+	BackendTypeSafe     Backend = "typesafe-system-one"
 )
 
 type Provider struct {
@@ -94,6 +96,8 @@ func portableCapability(capability Capability) (llmux.ProviderCapability, bool) 
 		return llmux.CapabilityFiles, true
 	case Search:
 		return llmux.CapabilitySearch, true
+	case Evaluation:
+		return llmux.CapabilityEvaluation, true
 	default:
 		return "", false
 	}
@@ -161,6 +165,7 @@ func providerFromProfile(profile opencompat.Profile) Provider {
 }
 
 var explicit = []Provider{
+	p("typesafe", BackendTypeSafe, Evaluation, ListModels),
 	p("anthropic", BackendAnthropic, Language, ListModels),
 	p("anthropic-aws", BackendBedrock, Language, ListModels),
 	p("azure", BackendAzure, Language, ListModels),

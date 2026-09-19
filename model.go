@@ -298,14 +298,17 @@ const (
 	CapabilityVideo         ProviderCapability = "video"
 	CapabilityFiles         ProviderCapability = "files"
 	CapabilitySearch        ProviderCapability = "search"
+	CapabilityEvaluation    ProviderCapability = "evaluation"
 )
 
 // ProviderDescriptor is a secret-free portable compatibility declaration.
 type ProviderDescriptor struct {
-	Name           string               `json:"name"`
-	WireProtocols  []string             `json:"wireProtocols,omitempty"`
-	Authentication []string             `json:"authentication,omitempty"`
-	Capabilities   []ProviderCapability `json:"capabilities,omitempty"`
+	Name           string   `json:"name"`
+	WireProtocols  []string `json:"wireProtocols,omitempty"`
+	Authentication []string `json:"authentication,omitempty"`
+	// Nil preserves the legacy language capability. A non-nil list explicitly
+	// declares capabilities, including for providers without text generation.
+	Capabilities []ProviderCapability `json:"capabilities,omitempty"`
 }
 
 type ProviderDescriber interface {
@@ -325,7 +328,9 @@ func DescribeProvider(provider Provider) (ProviderDescriptor, error) {
 			descriptor.Name = provider.Name()
 		}
 	}
-	descriptor.Capabilities = appendProviderCapability(descriptor.Capabilities, CapabilityLanguage)
+	if descriptor.Capabilities == nil {
+		descriptor.Capabilities = []ProviderCapability{CapabilityLanguage}
+	}
 	for _, current := range []struct {
 		capability ProviderCapability
 		supported  bool
@@ -339,6 +344,7 @@ func DescribeProvider(provider Provider) (ProviderDescriptor, error) {
 		{CapabilityVideo, implements[VideoProvider](provider)},
 		{CapabilityFiles, implements[FilesProvider](provider)},
 		{CapabilitySearch, implements[SearchProvider](provider)},
+		{CapabilityEvaluation, implements[EvaluationProvider](provider)},
 	} {
 		capability, supported := current.capability, current.supported
 		if supported {
@@ -376,6 +382,7 @@ const (
 	ModalitySpeech        Modality = "speech"
 	ModalityTranscription Modality = "transcription"
 	ModalitySearch        Modality = "search"
+	ModalityEvaluation    Modality = "evaluation"
 )
 
 // ModelCapabilities retains explicit provider support separately from unknown
